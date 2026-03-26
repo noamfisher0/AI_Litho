@@ -83,14 +83,14 @@ from skimage.transform import downscale_local_mean, resize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output_final"
+OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output"
 LOG_FILE     = OUTPUT_DIR / "spatial_study.log"
 
 # Default sample cap — overridden at runtime by --samples flag.
 # None means process every image in every subset.
 NUM_SAMPLES = None
 
-TARGET_RESOLUTIONS = [1024, 512, 256]
+TARGET_RESOLUTIONS = [1024, 512, 256, 128]
 
 DATA_DICT = {
     "MetalSet-Printed":    str(DATA_ROOT / "MetalSet"   / "printed"),
@@ -278,12 +278,21 @@ def compute_ssim(orig, recon) -> float:
     return float(num / den)
 
 
-def compute_hf_ratio(orig, recon) -> float:
-    """Fraction of high-frequency energy retained after downsampling+upsampling."""
+def compute_hf_ratio(orig, recon, fft_size: int = 512) -> float:
+    """Fraction of high-frequency energy retained after downsampling+upsampling.
+    Images are resized to fft_size x fft_size before the FFT to reduce cost —
+    512x512 is 16x cheaper than 2048x2048 with negligible accuracy difference."""
     def hf_energy(img):
-        F = np.abs(np.fft.fftshift(np.fft.fft2(
-            to_grayscale(img).astype(np.float64)
-        )))
+        gray = to_grayscale(img)
+        # Downsample to fft_size for speed before FFT
+        if gray.shape[0] != fft_size:
+            from skimage.transform import resize as sk_resize
+            gray = sk_resize(gray, (fft_size, fft_size),
+                             order=1, preserve_range=True,
+                             anti_aliasing=True).astype(np.float64)
+        else:
+            gray = gray.astype(np.float64)
+        F = np.abs(np.fft.fftshift(np.fft.fft2(gray)))
         h, w = F.shape
         mask = np.ones((h, w), dtype=bool)
         mask[h // 4: 3 * h // 4, w // 4: 3 * w // 4] = False
@@ -298,7 +307,7 @@ def compute_hf_ratio(orig, recon) -> float:
 # ------------------------------------------------------------------------------
 
 # Number of images processed per worker task — reduces IPC and CSV overhead
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 
 
 def _process_batch(task: tuple):
@@ -319,7 +328,7 @@ def _process_batch(task: tuple):
     import matplotlib
     matplotlib.use("Agg")
 
-    batch_items, resolutions, eval_methods, log_file = task
+    batch_items, resolutions, eval_methods, eval_metrics, log_file = task
 
     logger = setup_logging(Path(log_file))
     active_methods = {m: ALL_METHODS[m] for m in eval_methods if m in ALL_METHODS}
@@ -348,10 +357,10 @@ def _process_batch(task: tuple):
                     up      = upsample_to_original(ds, native_h)
                     up_gray = to_grayscale(up)
 
-                    psnr     = compute_psnr(orig_gray, up_gray)
-                    ssim     = compute_ssim(orig_gray, up_gray)
-                    mse      = compute_mse(orig_gray, up_gray)
-                    hf_ratio = compute_hf_ratio(img, up)
+                    psnr     = compute_psnr(orig_gray, up_gray)     if "psnr"     in eval_metrics else float("nan")
+                    ssim     = compute_ssim(orig_gray, up_gray)     if "ssim"     in eval_metrics else float("nan")
+                    mse      = compute_mse(orig_gray, up_gray)      if "mse"      in eval_metrics else float("nan")
+                    hf_ratio = compute_hf_ratio(img, up)            if "hf_ratio" in eval_metrics else float("nan")
 
                     all_rows.append({
                         "subset":     subset,
@@ -360,10 +369,10 @@ def _process_batch(task: tuple):
                         "filename":   file_path.name,
                         "resolution": res,
                         "method":     method_name,
-                        "psnr":       "" if math.isnan(psnr) else round(psnr,     6),
-                        "ssim":       round(ssim,     6),
-                        "mse":        round(mse,      6),
-                        "hf_ratio":   round(hf_ratio, 6),
+                        "psnr":       "" if math.isnan(psnr)     else round(psnr,     6),
+                        "ssim":       "" if math.isnan(ssim)     else round(ssim,     6),
+                        "mse":        "" if math.isnan(mse)      else round(mse,      6),
+                        "hf_ratio":   "" if math.isnan(hf_ratio) else round(hf_ratio, 6),
                     })
 
                 except Exception as exc:
@@ -472,12 +481,24 @@ def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
 # Evaluation orchestrator
 # ------------------------------------------------------------------------------
 
+ALL_METRICS = ("psnr", "ssim", "mse", "hf_ratio")
+
+METRIC_SHORTHAND = {
+    "psnr":     "psnr",
+    "ssim":     "ssim",
+    "mse":      "mse",
+    "hf":       "hf_ratio",
+    "hf_ratio": "hf_ratio",
+}
+
+
 def run_evaluation(
     data_dict:    dict,
     output_dir:   Path,
     num_workers:  int  = None,
     num_samples:  int  = None,
     eval_methods: list = None,
+    eval_metrics: list = None,
     force:        bool = False,
     timeout:      int  = 120,
 ):
@@ -489,12 +510,16 @@ def run_evaluation(
     ----------
     eval_methods : list of canonical method names to evaluate.
                    Defaults to all three (PointWise, Average, Fourier).
+    eval_metrics : list of metric keys to compute per image.
+                   Defaults to all four (psnr, ssim, mse, hf_ratio).
     num_samples  : cap per subset, or None for all images.
     """
     import tqdm
 
     if eval_methods is None:
         eval_methods = list(ALL_METHODS.keys())
+    if eval_metrics is None:
+        eval_metrics = list(ALL_METRICS)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     per_image_csv = output_dir / "results_per_image.csv"
@@ -511,7 +536,8 @@ def run_evaluation(
     completed = load_completed_images(per_image_csv)
     logger.info(
         f"Already completed: {len(completed)} images | "
-        f"eval_methods={eval_methods} | num_samples={num_samples}"
+        f"eval_methods={eval_methods} | eval_metrics={eval_metrics} | "
+        f"num_samples={num_samples}"
     )
 
     print("Scanning dataset directories ...")
@@ -550,7 +576,8 @@ def run_evaluation(
 
     # Chunk image_items into batches for reduced IPC overhead
     tasks = [
-        (image_items[i:i + BATCH_SIZE], TARGET_RESOLUTIONS, eval_methods, str(LOG_FILE))
+        (image_items[i:i + BATCH_SIZE], TARGET_RESOLUTIONS,
+         eval_methods, eval_metrics, str(LOG_FILE))
         for i in range(0, len(image_items), BATCH_SIZE)
     ]
     pending_images = len(image_items)
@@ -563,7 +590,8 @@ def run_evaluation(
         print(f"\nStarting fresh -- {pending_images} images to process "
               f"({pending} batches of {BATCH_SIZE}).\n")
 
-    print(f"Methods: {eval_methods}")
+    print(f"Methods:  {eval_methods}")
+    print(f"Metrics:  {eval_metrics}")
     print(f"Samples per subset: {'all' if num_samples is None else num_samples}\n")
 
     if not tasks:
@@ -1068,6 +1096,10 @@ def parse_args():
                    help="Methods for --evaluate and/or plotting. "
                         "Accepts: pw, avg, fft (or PointWise, Average, Fourier). "
                         "Default: all three.")
+    p.add_argument("--metrics",     type=str, nargs="+", default=None, metavar="METRIC",
+                   help="Metrics to compute during --evaluate. "
+                        "Accepts: psnr, ssim, mse, hf (or hf_ratio). "
+                        "Default: all four. Skipping hf greatly speeds up evaluation.")
     p.add_argument("--resolutions", type=int, nargs="+", default=None, metavar="N",
                    help="Resolutions to include in plots. Default: all.")
     p.add_argument("--datasets",    type=str, nargs="+", default=None, metavar="D",
@@ -1127,6 +1159,19 @@ if __name__ == "__main__":
     filter_resolutions = args.resolutions
     filter_methods     = resolved_methods   # used for both evaluate and plot
 
+    # ── Resolve metric shorthands (evaluate only) ─────────────────────────────
+    resolved_metrics = None
+    if args.metrics:
+        resolved_metrics = []
+        for m in args.metrics:
+            canonical = METRIC_SHORTHAND.get(m.lower(), m.lower())
+            if canonical not in ALL_METRICS:
+                print(f"Unknown metric '{m}'. "
+                      f"Valid options: psnr, ssim, mse, hf (or hf_ratio)")
+                sys.exit(1)
+            if canonical not in resolved_metrics:
+                resolved_metrics.append(canonical)
+
     logger.info(
         f"Session start | evaluate={args.evaluate} | plot={args.plot} | "
         f"tables={args.tables} | workers={args.workers} | "
@@ -1142,7 +1187,8 @@ if __name__ == "__main__":
             output_dir   = OUTPUT_DIR,
             num_workers  = args.workers,
             num_samples  = args.samples,
-            eval_methods = filter_methods,   # None = all three
+            eval_methods = filter_methods,    # None = all three
+            eval_metrics = resolved_metrics,  # None = all four
             force        = args.force,
             timeout      = args.timeout,
         )
