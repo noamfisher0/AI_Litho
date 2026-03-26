@@ -83,14 +83,14 @@ from skimage.transform import downscale_local_mean, resize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output"
+OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output_final"
 LOG_FILE     = OUTPUT_DIR / "spatial_study.log"
 
 # Default sample cap — overridden at runtime by --samples flag.
 # None means process every image in every subset.
 NUM_SAMPLES = None
 
-TARGET_RESOLUTIONS = [1024, 512, 256, 128]
+TARGET_RESOLUTIONS = [1024, 512, 256]
 
 DATA_DICT = {
     "MetalSet-Printed":    str(DATA_ROOT / "MetalSet"   / "printed"),
@@ -297,82 +297,85 @@ def compute_hf_ratio(orig, recon) -> float:
 # Worker function  (one call per image, runs in a subprocess)
 # ------------------------------------------------------------------------------
 
-def _process_image(task: tuple):
+# Number of images processed per worker task — reduces IPC and CSV overhead
+BATCH_SIZE = 32
+
+
+def _process_batch(task: tuple):
     """
-    Process a single image across the requested methods and resolutions.
+    Process a batch of images, returning all rows in one IPC round-trip.
 
     Parameters
     ----------
-    task : (subset, dataset, datatype, file_path_str,
-            resolutions, eval_methods, log_file)
-        eval_methods : list of method names to run (subset of ALL_METHODS keys)
+    task : (batch_items, resolutions, eval_methods, log_file)
+        batch_items : list of (subset, dataset, datatype, file_path_str)
 
     Returns
     -------
-    List of per-image CSV row dicts on success, or None on failure.
+    (all_rows, completed_pairs)
+        all_rows        : list of CSV row dicts for all images in the batch
+        completed_pairs : list of (subset, filename) for checkpointing
     """
     import matplotlib
     matplotlib.use("Agg")
 
-    (subset, dataset, datatype, file_path_str,
-     resolutions, eval_methods, log_file) = task
+    batch_items, resolutions, eval_methods, log_file = task
 
     logger = setup_logging(Path(log_file))
-    file_path = Path(file_path_str)
-    logger.debug(f"Processing {subset}/{file_path.name}")
-
-    img = load_image(file_path)
-    if img is None:
-        logger.warning(f"Failed to load {file_path} -- skipping")
-        return None
-
-    native_h  = img.shape[0]
-    orig_gray = to_grayscale(img)
-    rows      = []
-
-    # Use only the methods requested for this evaluation run
     active_methods = {m: ALL_METHODS[m] for m in eval_methods if m in ALL_METHODS}
 
-    for method_name, method_fn in active_methods.items():
-        for res in resolutions:
-            if res >= native_h:
-                logger.debug(
-                    f"SKIP {subset} | {method_name} | res={res} "
-                    f"(native={native_h}) | {file_path.name}"
-                )
-                continue
+    all_rows        = []
+    completed_pairs = []
 
-            try:
-                ds      = method_fn(img, res)
-                up      = upsample_to_original(ds, native_h)
-                up_gray = to_grayscale(up)
+    for subset, dataset, datatype, file_path_str in batch_items:
+        file_path = Path(file_path_str)
+        logger.debug(f"Processing {subset}/{file_path.name}")
 
-                psnr     = compute_psnr(orig_gray, up_gray)
-                ssim     = compute_ssim(orig_gray, up_gray)
-                mse      = compute_mse(orig_gray, up_gray)
-                hf_ratio = compute_hf_ratio(img, up)
+        img = load_image(file_path)
+        if img is None:
+            logger.warning(f"Failed to load {file_path} -- skipping")
+            continue
 
-                rows.append({
-                    "subset":     subset,
-                    "dataset":    dataset,
-                    "datatype":   datatype,
-                    "filename":   file_path.name,
-                    "resolution": res,
-                    "method":     method_name,
-                    "psnr":       "" if math.isnan(psnr) else round(psnr,     6),
-                    "ssim":       round(ssim,     6),
-                    "mse":        round(mse,      6),
-                    "hf_ratio":   round(hf_ratio, 6),
-                })
+        native_h  = img.shape[0]
+        orig_gray = to_grayscale(img)
 
-            except Exception as exc:
-                logger.warning(
-                    f"ERROR {subset} | {method_name} | res={res} | "
-                    f"{file_path.name}: {exc}"
-                )
+        for method_name, method_fn in active_methods.items():
+            for res in resolutions:
+                if res >= native_h:
+                    continue
+                try:
+                    ds      = method_fn(img, res)
+                    up      = upsample_to_original(ds, native_h)
+                    up_gray = to_grayscale(up)
 
-    logger.info(f"DONE {subset}/{file_path.name} -- {len(rows)} rows")
-    return rows if rows else None
+                    psnr     = compute_psnr(orig_gray, up_gray)
+                    ssim     = compute_ssim(orig_gray, up_gray)
+                    mse      = compute_mse(orig_gray, up_gray)
+                    hf_ratio = compute_hf_ratio(img, up)
+
+                    all_rows.append({
+                        "subset":     subset,
+                        "dataset":    dataset,
+                        "datatype":   datatype,
+                        "filename":   file_path.name,
+                        "resolution": res,
+                        "method":     method_name,
+                        "psnr":       "" if math.isnan(psnr) else round(psnr,     6),
+                        "ssim":       round(ssim,     6),
+                        "mse":        round(mse,      6),
+                        "hf_ratio":   round(hf_ratio, 6),
+                    })
+
+                except Exception as exc:
+                    logger.warning(
+                        f"ERROR {subset} | {method_name} | res={res} | "
+                        f"{file_path.name}: {exc}"
+                    )
+
+        completed_pairs.append((subset, file_path.name))
+
+    logger.info(f"Batch done: {len(completed_pairs)} images, {len(all_rows)} rows")
+    return all_rows, completed_pairs
 
 
 # ------------------------------------------------------------------------------
@@ -512,7 +515,7 @@ def run_evaluation(
     )
 
     print("Scanning dataset directories ...")
-    tasks = []
+    image_items = []
 
     for subset_key, image_dir in data_dict.items():
         parts    = subset_key.split("-", 1)
@@ -543,18 +546,22 @@ def run_evaluation(
         for f in files:
             if (subset_key, f.name) in completed:
                 continue
-            tasks.append((
-                subset_key, dataset, datatype,
-                str(f), TARGET_RESOLUTIONS, eval_methods, str(LOG_FILE),
-            ))
+            image_items.append((subset_key, dataset, datatype, str(f)))
 
-    pending = len(tasks)
+    # Chunk image_items into batches for reduced IPC overhead
+    tasks = [
+        (image_items[i:i + BATCH_SIZE], TARGET_RESOLUTIONS, eval_methods, str(LOG_FILE))
+        for i in range(0, len(image_items), BATCH_SIZE)
+    ]
+    pending_images = len(image_items)
+    pending        = len(tasks)
 
     if completed:
         print(f"\nResuming -- {len(completed)} images already done, "
-              f"{pending} remaining.\n")
+              f"{pending_images} remaining ({pending} batches of {BATCH_SIZE}).\n")
     else:
-        print(f"\nStarting fresh -- {pending} images to process.\n")
+        print(f"\nStarting fresh -- {pending_images} images to process "
+              f"({pending} batches of {BATCH_SIZE}).\n")
 
     print(f"Methods: {eval_methods}")
     print(f"Samples per subset: {'all' if num_samples is None else num_samples}\n")
@@ -571,48 +578,49 @@ def run_evaluation(
     num_workers = min(num_workers, pending)
 
     logger.info(
-        f"Starting evaluation | images={pending} | "
-        f"workers={num_workers} | timeout={timeout}s"
+        f"Starting evaluation | images={pending_images} | batches={pending} | "
+        f"batch_size={BATCH_SIZE} | workers={num_workers} | timeout={timeout}s"
     )
-    print(f"Workers: {num_workers}  |  Images to process: {pending}\n")
+    print(f"Workers: {num_workers}  |  Batches: {pending}  |  Images: {pending_images}\n")
 
     failed_images = 0
     timed_out     = 0
 
     with cf.ProcessPoolExecutor(max_workers=num_workers) as executor:
         future_to_task = {
-            executor.submit(_process_image, task): task
+            executor.submit(_process_batch, task): task
             for task in tasks
         }
 
         with tqdm.tqdm(
-            total=pending,
+            total=pending_images,
             desc="Processing images",
             unit="img",
             dynamic_ncols=True,
             file=sys.stdout,
         ) as pbar:
             for future in cf.as_completed(future_to_task, timeout=None):
-                task       = future_to_task[future]
-                subset_key = task[0]
-                filename   = Path(task[3]).name
+                batch_task = future_to_task[future]
+                n_in_batch = len(batch_task[0])
 
                 try:
-                    rows = future.result(timeout=timeout)
-                    if rows:
-                        append_image_rows(per_image_csv, rows)
+                    result = future.result(timeout=timeout * BATCH_SIZE)
+                    if result:
+                        all_rows, completed_pairs = result
+                        if all_rows:
+                            append_image_rows(per_image_csv, all_rows)
                     else:
-                        failed_images += 1
-                        logger.warning(f"No rows returned for {subset_key}/{filename}")
+                        failed_images += n_in_batch
+                        logger.warning(f"Batch returned no results")
                 except cf.TimeoutError:
-                    timed_out += 1
-                    logger.error(f"TIMEOUT ({timeout}s) {subset_key}/{filename} -- skipped")
-                    pbar.set_postfix_str(f"timeout: {filename[:20]}", refresh=True)
+                    timed_out += n_in_batch
+                    logger.error(f"TIMEOUT batch of {n_in_batch} images -- skipped")
+                    pbar.set_postfix_str("batch timeout", refresh=True)
                 except Exception as exc:
-                    failed_images += 1
-                    logger.error(f"ERROR {subset_key}/{filename}: {exc}")
+                    failed_images += n_in_batch
+                    logger.error(f"ERROR in batch: {exc}")
 
-                pbar.update(1)
+                pbar.update(n_in_batch)
 
     issues = failed_images + timed_out
     if issues:
