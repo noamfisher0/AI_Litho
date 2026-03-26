@@ -1,88 +1,194 @@
+"""
+spatialstudy.py
+===============
+Spatial resolution study for the LithoBench dataset.
+
+Architecture
+------------
+Evaluation uses a flat image-level work queue fed to a
+ProcessPoolExecutor.  Each worker processes one image at a time and
+returns one result row.  The main process writes each result to
+results_per_image.csv immediately, giving image-level checkpointing.
+At the end the main process aggregates the per-image CSV into
+results_average.csv, which the plotting functions consume.
+
+Two output CSVs
+---------------
+  results_per_image.csv   — one row per (image × method × resolution)
+                            written continuously; used for checkpointing
+                            and provides full metric distributions
+  results_average.csv    — one row per (subset × method × resolution)
+                            computed from results_per_image.csv at the
+                            end of a completed or resumed run
+
+Resume behaviour
+----------------
+On startup the main process reads results_per_image.csv and builds the
+set of already-completed (subset, filename) pairs.  Only the remaining
+images are added to the work queue.  Stop the run at any time with
+Ctrl+C — the next run resumes from exactly where it left off.
+Use --force to discard existing results and start fresh.
+
+Flags
+-----
+  --evaluate            run the image-level parallel evaluation
+  --plot                generate figures from results_average.csv
+  --tables              print per-subset metric tables to the terminal
+  --workers N           number of worker processes (default: cpu_count-1)
+  --force               delete existing CSVs and start fresh
+  --save-plots          save PNG figures to the output directory
+  --timeout N           per-image timeout in seconds (default: 120)
+
+Usage examples
+--------------
+  python spatialstudy.py --evaluate --workers 8
+  python spatialstudy.py --evaluate --workers 8 --timeout 60
+  python spatialstudy.py --plot --save-plots
+  python spatialstudy.py --evaluate --plot --force
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Imports
+# ──────────────────────────────────────────────────────────────────────────────
+import argparse
+import concurrent.futures as cf
+import csv
+import logging
+import logging.handlers
+import math
+import os
 import random
+import sys
+import time
 from pathlib import Path
 
 import cv2
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import numpy as np
-import tqdm
-from skimage.transform import resize, downscale_local_mean
+import matplotlib.pyplot as plt
+from skimage.transform import downscale_local_mean, resize
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Paths & Dataset
+# Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_ROOT = PROJECT_ROOT / "lithobench-main"
+DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
+OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output_fourrier"
+LOG_FILE     = OUTPUT_DIR / "spatial_study.log"
 
-DATA_DICT = {
-    "MetalSet-Printed":     str(DATA_ROOT / "MetalSet"    / "printed"),
-    "MetalSet-Resist":      str(DATA_ROOT / "MetalSet"    / "resist"),
-    "MetalSet-Target":      str(DATA_ROOT / "MetalSet"    / "target"),
-    "MetalSet-LevelILT":    str(DATA_ROOT / "MetalSet"    / "levelsetILT"),
-    "MetalSet-Litho":       str(DATA_ROOT / "MetalSet"    / "litho"),
-    "MetalSet-PixelILT":    str(DATA_ROOT / "MetalSet"    / "pixelILT"),
-    "ViaSet-Printed":       str(DATA_ROOT / "ViaSet"      / "printed"),
-    "ViaSet-Resist":        str(DATA_ROOT / "ViaSet"      / "resist"),
-    "ViaSet-Target":        str(DATA_ROOT / "ViaSet"      / "target"),
-    "ViaSet-LevelILT":      str(DATA_ROOT / "ViaSet"      / "levelsetILT"),
-    "ViaSet-Litho":         str(DATA_ROOT / "ViaSet"      / "litho"),
-    "ViaSet-PixelILT":      str(DATA_ROOT / "ViaSet"      / "pixelILT"),
-    "StdContact-Printed":   str(DATA_ROOT / "StdContact"  / "printed"),
-    "StdContact-Resist":    str(DATA_ROOT / "StdContact"  / "resist"),
-    "StdContact-Target":    str(DATA_ROOT / "StdContact"  / "target"),
-    "StdContact-Litho":     str(DATA_ROOT / "StdContact"  / "litho"),
-    "StdContact-PixelILT":  str(DATA_ROOT / "StdContact"  / "pixelILT"),
-    "StdMetal-Printed":     str(DATA_ROOT / "StdMetal"    / "printed"),
-    "StdMetal-Resist":      str(DATA_ROOT / "StdMetal"    / "resist"),
-    "StdMetal-Target":      str(DATA_ROOT / "StdMetal"    / "target"),
-    "StdMetal-Litho":       str(DATA_ROOT / "StdMetal"    / "litho"),
-    "StdMetal-PixelILT":    str(DATA_ROOT / "StdMetal"    / "pixelILT"),
-}
+# Set to an integer to cap images per subset (useful for test runs).
+# Set to None to process every image in every subset.
+NUM_SAMPLES = 500
 
-# Target resolutions to evaluate (must be integer divisors of 2048 for Average
-# method; Point-Wise and Fourier work with any value)
 TARGET_RESOLUTIONS = [1024, 512, 256, 128]
 
-# How many images to sample per subset for the study
-NUM_SAMPLES = 5
+DATA_DICT = {
+    "MetalSet-Printed":    str(DATA_ROOT / "MetalSet"   / "printed"),
+    "MetalSet-Resist":     str(DATA_ROOT / "MetalSet"   / "resist"),
+    "MetalSet-Target":     str(DATA_ROOT / "MetalSet"   / "target"),
+    "MetalSet-LevelILT":   str(DATA_ROOT / "MetalSet"   / "levelsetILT"),
+    "MetalSet-Litho":      str(DATA_ROOT / "MetalSet"   / "litho"),
+    "MetalSet-PixelILT":   str(DATA_ROOT / "MetalSet"   / "pixelILT"),
+    "ViaSet-Printed":      str(DATA_ROOT / "ViaSet"     / "printed"),
+    "ViaSet-Resist":       str(DATA_ROOT / "ViaSet"     / "resist"),
+    "ViaSet-Target":       str(DATA_ROOT / "ViaSet"     / "target"),
+    "ViaSet-LevelILT":     str(DATA_ROOT / "ViaSet"     / "levelsetILT"),
+    "ViaSet-Litho":        str(DATA_ROOT / "ViaSet"     / "litho"),
+    "ViaSet-PixelILT":     str(DATA_ROOT / "ViaSet"     / "pixelILT"),
+    "StdContact-Printed":  str(DATA_ROOT / "StdContact" / "printed"),
+    "StdContact-Resist":   str(DATA_ROOT / "StdContact" / "resist"),
+    "StdContact-Target":   str(DATA_ROOT / "StdContact" / "target"),
+    "StdContact-Litho":    str(DATA_ROOT / "StdContact" / "litho"),
+    "StdContact-PixelILT": str(DATA_ROOT / "StdContact" / "pixelILT"),
+    "StdMetal-Printed":    str(DATA_ROOT / "StdMetal"   / "printed"),
+    "StdMetal-Resist":     str(DATA_ROOT / "StdMetal"   / "resist"),
+    "StdMetal-Target":     str(DATA_ROOT / "StdMetal"   / "target"),
+    "StdMetal-Litho":      str(DATA_ROOT / "StdMetal"   / "litho"),
+    "StdMetal-PixelILT":   str(DATA_ROOT / "StdMetal"   / "pixelILT"),
+}
+
+# ── CSV schemas ───────────────────────────────────────────────────────────────
+
+# One row per (image × method × resolution)
+PER_IMAGE_FIELDS = [
+    "subset", "dataset", "datatype",
+    "filename", "resolution", "method",
+    "psnr", "ssim", "mse", "hf_ratio",
+]
+
+# One row per (subset × method × resolution) — aggregated
+AVERAGED_FIELDS = [
+    "subset", "dataset", "datatype", "num_samples",
+    "resolution", "method",
+    "psnr", "ssim", "mse", "hf_ratio",
+]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data loading helpers
+# Logging
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_data(data_dict, selected_keys=None, number_of_samples=None):
-    if selected_keys is None:
-        selected_keys = list(data_dict.keys())
+def setup_logging(log_file: Path) -> logging.Logger:
+    """
+    Configure the 'spatialstudy' logger to write to a rotating file.
+    Safe to call from both the main process and worker processes —
+    each call is idempotent (handlers are not duplicated).
+    """
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("spatialstudy")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | PID %(process)d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10 * 1024 * 1024, backupCount=3,
+        encoding="utf-8", mode="a",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
 
-    data = {}
-    for key in selected_keys:
-        path = Path(data_dict[key])
-        if not path.exists():
-            raise FileNotFoundError(f"Directory does not exist: {path}")
 
-        files = [p.name for p in path.iterdir() if p.is_file()]
-        selected_files = (
-            random.sample(files, min(number_of_samples, len(files)))
-            if number_of_samples is not None else files
-        )
+def get_logger() -> logging.Logger:
+    return logging.getLogger("spatialstudy")
 
-        data[key] = []
-        for file in tqdm.tqdm(selected_files, desc=f"Loading {key}"):
-            img = plt.imread(path / file)
-            data[key].append(img)
 
-        data[key] = np.array(data[key])
+# ──────────────────────────────────────────────────────────────────────────────
+# Image loading
+# ──────────────────────────────────────────────────────────────────────────────
 
-    return data
+def load_image(path: Path):
+    """
+    Load an image with cv2 (no GUI involvement) and return a float32 array
+    in RGB channel order normalised to [0, 1].
+    Returns None on failure.
+    """
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 3:
+        if img.shape[2] == 3:
+            img = img[..., ::-1]          # BGR  → RGB
+        elif img.shape[2] == 4:
+            img = img[..., [2, 1, 0, 3]]  # BGRA → RGBA
+    img = img.astype("float32")
+    if img.max() > 1.0:
+        img = img / 255.0
+    return img
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Image utilities
+# ──────────────────────────────────────────────────────────────────────────────
 
 def to_grayscale(image):
-    """Convert image to grayscale if it is RGB/RGBA."""
     if image.ndim == 3:
-        return np.mean(image[..., :3], axis=-1)
+        return image[..., :3].mean(axis=-1)
     return image
 
 
@@ -90,167 +196,57 @@ def to_grayscale(image):
 # Downsampling methods
 # ──────────────────────────────────────────────────────────────────────────────
 
-def downsample_pointwise(image: np.ndarray, target_size: int) -> np.ndarray:
+def downsample_pointwise(image, target_size: int):
     """
     Point-Wise (Nearest-Neighbour) Downsampling
     -------------------------------------------
-    Selects every N-th pixel along each axis (stride = original / target).
-    No smoothing is applied — the output pixel value is simply copied from
-    the nearest source pixel.  Very fast, zero blurring, but can introduce
-    aliasing artefacts (jagged edges, moire patterns) when the scale factor
-    is large, because high-frequency content is not removed before subsampling.
+    Selects every N-th pixel (stride = original / target).  Fast and
+    zero blurring, but susceptible to aliasing when scale factor is large.
     """
     h, w = image.shape[:2]
-    stride_h = h // target_size
-    stride_w = w // target_size
-    return image[::stride_h, ::stride_w][: target_size, : target_size]
+    sh, sw = h // target_size, w // target_size
+    return image[::sh, ::sw][:target_size, :target_size]
 
 
-def downsample_average(image: np.ndarray, target_size: int) -> np.ndarray:
+def downsample_average(image, target_size: int):
     """
     Average (Block-Mean) Downsampling
     ----------------------------------
-    Partitions the image into non-overlapping blocks of size
-    (original / target) x (original / target) and replaces each block with
-    its mean value.  This acts as a low-pass filter before subsampling,
-    which suppresses aliasing.  The result is smoother than Point-Wise but
-    may appear slightly blurred because fine detail is averaged out.
-    Requires the original size to be exactly divisible by the target size.
-    Uses skimage's `downscale_local_mean` under the hood.
+    Replaces each non-overlapping block with its mean — acts as a box
+    low-pass filter, suppressing aliasing at the cost of slight blurring.
+    Requires the original size to be divisible by the target size.
     """
     h, w = image.shape[:2]
-    factor_h = h // target_size
-    factor_w = w // target_size
-    if image.ndim == 3:
-        factors = (factor_h, factor_w, 1)
-    else:
-        factors = (factor_h, factor_w)
+    fh, fw = h // target_size, w // target_size
+    factors = (fh, fw, 1) if image.ndim == 3 else (fh, fw)
     return downscale_local_mean(image, factors).astype(image.dtype)
 
 
-def downsample_fourier(image: np.ndarray, target_size: int) -> np.ndarray:
+def downsample_fourier(image, target_size: int):
     """
     Fourier (Frequency-Domain) Downsampling
     ----------------------------------------
-    Transforms the image to the frequency domain via a 2-D FFT, retains only
-    the central low-frequency coefficients (a crop of size target x target in
-    frequency space), then inverse-transforms back to the spatial domain.
-    This is the theoretically optimal anti-aliasing approach: it enforces the
-    Nyquist limit exactly and preserves all frequencies that are representable
-    at the target resolution while discarding those that would alias.
-    Works on real-valued images; the imaginary residual after iFFT is
-    discarded (it is numerically negligible for real inputs).
+    Crops the 2-D FFT spectrum to the central target×target coefficients,
+    enforcing the Nyquist limit exactly.  Theoretically optimal
+    anti-aliasing; most computationally expensive of the three methods.
     """
-    if image.ndim == 3:
-        channels = [_fourier_channel(image[..., c], target_size)
-                    for c in range(image.shape[2])]
-        result = np.stack(channels, axis=-1)
-    else:
-        result = _fourier_channel(image, target_size)
+    def _channel(ch):
+        F    = np.fft.fftshift(np.fft.fft2(ch.astype(np.float64)))
+        cy, cx = F.shape[0] // 2, F.shape[1] // 2
+        half = target_size // 2
+        Fc   = F[cy - half:cy + half, cx - half:cx + half]
+        scale = (target_size ** 2) / (F.shape[0] * F.shape[1])
+        return (np.fft.ifft2(np.fft.ifftshift(Fc)).real * scale).astype(np.float32)
 
-    # Rescale to the original value range to avoid clipping artefacts
-    orig_min, orig_max = image.min(), image.max()
-    result = np.clip(result, result.min(), result.max())
-    if result.max() - result.min() > 1e-8:
-        result = (result - result.min()) / (result.max() - result.min())
-        result = result * (orig_max - orig_min) + orig_min
+    result = (np.stack([_channel(image[..., c]) for c in range(image.shape[2])], axis=-1)
+              if image.ndim == 3 else _channel(image))
+
+    lo, hi   = image.min(), image.max()
+    rlo, rhi = result.min(), result.max()
+    if rhi - rlo > 1e-8:
+        result = (result - rlo) / (rhi - rlo) * (hi - lo) + lo
     return result.astype(np.float32)
 
-
-def _fourier_channel(channel: np.ndarray, target_size: int) -> np.ndarray:
-    """Helper: Fourier downsampling for a single 2-D channel."""
-    F = np.fft.fftshift(np.fft.fft2(channel.astype(np.float64)))
-    h, w = F.shape
-    ch, cw = h // 2, w // 2
-    half = target_size // 2
-    F_crop = F[ch - half: ch + half, cw - half: cw + half]
-    # Scale factor preserves mean pixel energy
-    scale = (target_size ** 2) / (h * w)
-    reconstructed = np.fft.ifft2(np.fft.ifftshift(F_crop)).real * scale
-    return reconstructed.astype(np.float32)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Quality metrics
-# ──────────────────────────────────────────────────────────────────────────────
-
-def upsample_to_original(image: np.ndarray, original_size: int) -> np.ndarray:
-    """Upscale a downsampled image back to original_size x original_size
-    (nearest-neighbour, so no extra smoothing is introduced)."""
-    return resize(image, (original_size, original_size),
-                  order=0, preserve_range=True, anti_aliasing=False
-                  ).astype(np.float32)
-
-
-def compute_mse(original: np.ndarray, reconstructed: np.ndarray) -> float:
-    """Mean Squared Error — lower is better."""
-    o = original.astype(np.float64)
-    r = reconstructed.astype(np.float64)
-    return float(np.mean((o - r) ** 2))
-
-
-def compute_psnr(original: np.ndarray, reconstructed: np.ndarray,
-                 data_range: float = None) -> float:
-    """
-    Peak Signal-to-Noise Ratio (dB) — higher is better.
-    data_range defaults to the original image's value range.
-    """
-    mse = compute_mse(original, reconstructed)
-    if mse == 0:
-        return float("inf")
-    if data_range is None:
-        data_range = float(original.max() - original.min())
-        if data_range == 0:
-            return float("inf")
-    return float(20 * np.log10(data_range) - 10 * np.log10(mse))
-
-
-def compute_ssim(original: np.ndarray, reconstructed: np.ndarray) -> float:
-    """
-    Structural Similarity Index (SSIM) — ranges [-1, 1]; 1 = identical.
-    Uses the standard constants C1=(0.01*L)^2, C2=(0.03*L)^2 with L=data_range.
-    """
-    o = original.astype(np.float64)
-    r = reconstructed.astype(np.float64)
-    L = float(o.max() - o.min()) or 1.0
-    C1, C2 = (0.01 * L) ** 2, (0.03 * L) ** 2
-
-    mu_o, mu_r = o.mean(), r.mean()
-    sigma_o = np.sqrt(np.mean((o - mu_o) ** 2))
-    sigma_r = np.sqrt(np.mean((r - mu_r) ** 2))
-    sigma_or = np.mean((o - mu_o) * (r - mu_r))
-
-    num = (2 * mu_o * mu_r + C1) * (2 * sigma_or + C2)
-    den = (mu_o ** 2 + mu_r ** 2 + C1) * (sigma_o ** 2 + sigma_r ** 2 + C2)
-    return float(num / den)
-
-
-def compute_hf_ratio(original: np.ndarray, reconstructed: np.ndarray) -> float:
-    """
-    High-Frequency Energy Retention Ratio.
-    Computes the fraction of high-frequency energy (outside the central 50%
-    of the Fourier spectrum) retained after downsampling+upsampling.
-    A ratio close to 1 means fine detail is well preserved; close to 0 means
-    high-frequency content has been lost.
-    """
-    def hf_energy(img):
-        F = np.abs(np.fft.fftshift(np.fft.fft2(img.astype(np.float64))))
-        h, w = F.shape
-        mask = np.ones((h, w), dtype=bool)
-        mask[h // 4: 3 * h // 4, w // 4: 3 * w // 4] = False
-        return float(np.sum(F[mask] ** 2))
-
-    o_gray = to_grayscale(original)
-    r_gray = to_grayscale(reconstructed)
-    orig_hf = hf_energy(o_gray)
-    if orig_hf == 0:
-        return 1.0
-    return float(hf_energy(r_gray) / orig_hf)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Core evaluation loop
-# ──────────────────────────────────────────────────────────────────────────────
 
 METHODS = {
     "PointWise": downsample_pointwise,
@@ -259,61 +255,494 @@ METHODS = {
 }
 
 
-def evaluate_dataset(data: dict,
-                     resolutions: list = TARGET_RESOLUTIONS) -> dict:
-    """
-    For every (subset, method, resolution) triplet, compute the four quality
-    metrics averaged across all sampled images.
+# ──────────────────────────────────────────────────────────────────────────────
+# Quality metrics
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Returns a nested dict:
-        results[subset][method][resolution] = {
-            "mse": float, "psnr": float, "ssim": float, "hf_ratio": float
+def upsample_to_original(image, original_size: int):
+    """Nearest-neighbour upscale back to original_size — introduces no
+    additional smoothing so only the downsampling artefacts are measured."""
+    return resize(image, (original_size, original_size),
+                  order=0, preserve_range=True,
+                  anti_aliasing=False).astype("float32")
+
+
+def compute_mse(orig, recon) -> float:
+    return float(np.mean(
+        (orig.astype(np.float64) - recon.astype(np.float64)) ** 2
+    ))
+
+
+def compute_psnr(orig, recon) -> float:
+    """Returns nan for identical or flat images — these appear as gaps on
+    plots, which is the correct behaviour (no meaningful PSNR to report)."""
+    mse = compute_mse(orig, recon)
+    if mse == 0:
+        return float("nan")
+    data_range = float(orig.max() - orig.min())
+    if data_range == 0:
+        return float("nan")
+    return float(20 * np.log10(data_range) - 10 * np.log10(mse))
+
+
+def compute_ssim(orig, recon) -> float:
+    o, r = orig.astype(np.float64), recon.astype(np.float64)
+    L    = float(o.max() - o.min()) or 1.0
+    C1, C2   = (0.01 * L) ** 2, (0.03 * L) ** 2
+    mu_o, mu_r   = o.mean(), r.mean()
+    sig_o  = np.sqrt(np.mean((o - mu_o) ** 2))
+    sig_r  = np.sqrt(np.mean((r - mu_r) ** 2))
+    sig_or = np.mean((o - mu_o) * (r - mu_r))
+    num = (2 * mu_o * mu_r + C1) * (2 * sig_or  + C2)
+    den = (mu_o**2 + mu_r**2 + C1) * (sig_o**2 + sig_r**2 + C2)
+    return float(num / den)
+
+
+def compute_hf_ratio(orig, recon) -> float:
+    """Fraction of high-frequency energy (outside central 50% of spectrum)
+    retained after downsampling+upsampling.  1 = perfect retention."""
+    def hf_energy(img):
+        F = np.abs(np.fft.fftshift(np.fft.fft2(
+            to_grayscale(img).astype(np.float64)
+        )))
+        h, w  = F.shape
+        mask  = np.ones((h, w), dtype=bool)
+        mask[h // 4: 3 * h // 4, w // 4: 3 * w // 4] = False
+        return float(np.sum(F[mask] ** 2))
+
+    orig_hf = hf_energy(orig)
+    return float(hf_energy(recon) / orig_hf) if orig_hf > 0 else 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Worker function  (one call per image — runs in a subprocess)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _process_image(task: tuple):
+    """
+    Process a single image across all methods and resolutions.
+
+    Parameters
+    ----------
+    task : (subset, dataset, datatype, file_path_str, resolutions, log_file)
+
+    Returns
+    -------
+    List of per-image CSV row dicts on success, or None on failure.
+    """
+    subset, dataset, datatype, file_path_str, resolutions, log_file = task
+
+    import matplotlib
+    matplotlib.use("Agg")   # non-GUI — must be set before pyplot in each worker
+
+    logger = setup_logging(Path(log_file))
+    file_path = Path(file_path_str)
+    logger.debug(f"Processing {subset}/{file_path.name}")
+
+    img = load_image(file_path)
+    if img is None:
+        logger.warning(f"Failed to load {file_path} — skipping")
+        return None
+
+    native_h  = img.shape[0]
+    orig_gray = to_grayscale(img)
+    rows      = []
+
+    for method_name, method_fn in METHODS.items():
+        for res in resolutions:
+
+            # Skip degenerate case: target >= native resolution
+            if res >= native_h:
+                logger.debug(
+                    f"SKIP {subset} | {method_name} | res={res} "
+                    f"(native={native_h}) | {file_path.name}"
+                )
+                continue
+
+            try:
+                ds      = method_fn(img, res)
+                up      = upsample_to_original(ds, native_h)
+                up_gray = to_grayscale(up)
+
+                psnr     = compute_psnr(orig_gray, up_gray)
+                ssim     = compute_ssim(orig_gray, up_gray)
+                mse      = compute_mse(orig_gray, up_gray)
+                hf_ratio = compute_hf_ratio(img, up)
+
+                rows.append({
+                    "subset":     subset,
+                    "dataset":    dataset,
+                    "datatype":   datatype,
+                    "filename":   file_path.name,
+                    "resolution": res,
+                    "method":     method_name,
+                    "psnr":       "" if math.isnan(psnr)  else round(psnr,     6),
+                    "ssim":       round(ssim,     6),
+                    "mse":        round(mse,      6),
+                    "hf_ratio":   round(hf_ratio, 6),
+                })
+
+            except Exception as exc:
+                logger.warning(
+                    f"ERROR {subset} | {method_name} | res={res} | "
+                    f"{file_path.name}: {exc}"
+                )
+
+    logger.info(f"DONE {subset}/{file_path.name} — {len(rows)} rows")
+    return rows if rows else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CSV helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_completed_images(csv_path: Path) -> set:
+    """
+    Return the set of (subset, filename) pairs already present in the
+    per-image CSV.  Used to build the resume queue.
+    """
+    done = set()
+    if not csv_path.exists():
+        return done
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                done.add((row["subset"], row["filename"]))
+    except Exception:
+        pass
+    return done
+
+
+def append_image_rows(csv_path: Path, rows: list):
+    """
+    Append per-image result rows to the per-image CSV.
+    Called from the main process only — no locking required.
+    """
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=PER_IMAGE_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
+    """
+    Read results_per_image.csv and write results_average.csv.
+    Computes the mean of each metric across all images for every
+    (subset × method × resolution) combination, ignoring nan values.
+    """
+    # Accumulate sums and counts independently per metric so that a nan in
+    # one metric (e.g. PSNR for a perfect reconstruction) does not discard
+    # the valid values of the other metrics (e.g. MSE=0.0) for that image.
+    METRICS = ("psnr", "ssim", "mse", "hf_ratio")
+    sums   = {}   # (subset, method, res) → {metric: float}
+    counts = {}   # (subset, method, res) → {metric: int}
+    meta   = {}   # subset → (dataset, datatype)
+
+    with open(per_image_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            key = (row["subset"], row["method"], int(row["resolution"]))
+            if key not in sums:
+                sums[key]   = {m: 0.0 for m in METRICS}
+                counts[key] = {m: 0   for m in METRICS}
+                meta[row["subset"]] = (row["dataset"], row["datatype"])
+
+            for m in METRICS:
+                raw = row.get(m, "")
+                if raw == "" or raw is None:
+                    continue          # missing — skip this metric only
+                v = float(raw)
+                if math.isnan(v) or math.isinf(v):
+                    continue          # invalid — skip this metric only
+                sums[key][m]   += v
+                counts[key][m] += 1
+
+    # Write averaged CSV — each metric averaged over its own valid count
+    with open(averaged_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=AVERAGED_FIELDS)
+        w.writeheader()
+        for (subset, method, res), s in sorted(sums.items()):
+            dataset, datatype = meta[subset]
+            # Use the maximum valid count across metrics as num_samples
+            n = max(counts[(subset, method, res)].values())
+
+            def avg(m):
+                c = counts[(subset, method, res)][m]
+                return round(s[m] / c, 6) if c else ""
+
+            w.writerow({
+                "subset":      subset,
+                "dataset":     dataset,
+                "datatype":    datatype,
+                "num_samples": n,
+                "resolution":  res,
+                "method":      method,
+                "psnr":        avg("psnr"),
+                "ssim":        avg("ssim"),
+                "mse":         avg("mse"),
+                "hf_ratio":    avg("hf_ratio"),
+            })
+
+    return averaged_csv
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Evaluation orchestrator
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_evaluation(
+    data_dict:   dict,
+    output_dir:  Path,
+    num_workers: int  = None,
+    force:       bool = False,
+    timeout:     int  = 120,
+):
+    """
+    Build a flat image-level work queue, dispatch to a ProcessPoolExecutor,
+    stream results to results_per_image.csv, then aggregate to
+    results_average.csv.
+
+    - Perfect load balancing: all workers consume from the same queue
+      regardless of which subset an image belongs to.
+    - Image-level resume: on restart only images not yet in
+      results_per_image.csv are re-queued.
+    - Per-image timeout: a hung image is cancelled after `timeout` seconds
+      and the worker is replaced automatically.
+    - Single tqdm bar counting images, not subsets.
+    """
+    import tqdm
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    per_image_csv = output_dir / "results_per_image.csv"
+    averaged_csv  = output_dir / "results_average.csv"
+    logger        = get_logger()
+
+    # ── Force: clear existing results ─────────────────────────────────────────
+    if force:
+        for p in (per_image_csv, averaged_csv):
+            if p.exists():
+                p.unlink()
+        logger.info("--force: cleared existing CSVs")
+        print("--force: cleared existing results, starting fresh.\n")
+
+    # ── Load already-completed (subset, filename) pairs ───────────────────────
+    completed = load_completed_images(per_image_csv)
+    logger.info(f"Already completed: {len(completed)} (subset, image) pairs")
+
+    # ── Build flat work queue ─────────────────────────────────────────────────
+    print("Scanning dataset directories ...")
+    tasks      = []
+    skipped    = 0
+    subset_sizes = {}
+
+    for subset_key, image_dir in data_dict.items():
+        parts    = subset_key.split("-", 1)
+        dataset  = parts[0]
+        datatype = parts[1] if len(parts) > 1 else ""
+        path     = Path(image_dir)
+
+        if not path.exists():
+            logger.warning(f"Directory not found, skipping: {path}")
+            print(f"  WARNING: {path} not found — skipping {subset_key}")
+            continue
+
+        files = sorted(f for f in path.iterdir() if f.is_file())
+
+        # Apply per-subset sample cap before filtering completed images
+        if NUM_SAMPLES is not None:
+            files = random.sample(files, min(NUM_SAMPLES, len(files)))
+
+        subset_sizes[subset_key] = len(files)
+
+        for f in files:
+            if (subset_key, f.name) in completed:
+                skipped += 1
+                continue
+            tasks.append((
+                subset_key, dataset, datatype,
+                str(f), TARGET_RESOLUTIONS, str(LOG_FILE),
+            ))
+
+    total_images   = sum(subset_sizes.values())
+    pending_images = len(tasks)
+    done_images    = total_images - pending_images - skipped  # already in CSV but outside sample
+
+    if completed:
+        print(
+            f"\nResuming — {len(completed)} images already done, "
+            f"{pending_images} remaining.\n"
+        )
+    else:
+        print(f"\nStarting fresh — {pending_images} images to process.\n")
+
+    if not tasks:
+        print("Nothing to do — all images already processed.")
+        logger.info("All images already complete, aggregating CSV.")
+        aggregate_to_averaged_csv(per_image_csv, averaged_csv)
+        print(f"Averaged CSV written to: {averaged_csv}")
+        return averaged_csv
+
+    if num_workers is None:
+        num_workers = max(1, os.cpu_count() - 1)
+    num_workers = min(num_workers, pending_images)
+
+    logger.info(
+        f"Starting evaluation | images={pending_images} | "
+        f"workers={num_workers} | timeout={timeout}s"
+    )
+    print(f"Workers: {num_workers}  |  Images to process: {pending_images}\n")
+
+    # ── Dispatch with ProcessPoolExecutor ─────────────────────────────────────
+    failed_images = 0
+    timed_out     = 0
+
+    with cf.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks up front — executor manages the queue internally
+        future_to_task = {
+            executor.submit(_process_image, task): task
+            for task in tasks
         }
-    """
-    results = {}
-    for subset, images in data.items():
-        results[subset] = {m: {r: [] for r in resolutions} for m in METHODS}
-        for img in tqdm.tqdm(images, desc=f"Evaluating {subset}"):
-            img_f = img.astype(np.float32)
-            orig_gray = to_grayscale(img_f)
-            orig_size = img_f.shape[0]          # assumed square
 
-            for method_name, method_fn in METHODS.items():
-                for res in resolutions:
-                    ds = method_fn(img_f, res)
-                    up = upsample_to_original(ds, orig_size)
+        with tqdm.tqdm(
+            total=pending_images,
+            desc="Processing images",
+            unit="img",
+            dynamic_ncols=True,
+            file=sys.stdout,
+        ) as pbar:
+            for future in cf.as_completed(future_to_task, timeout=None):
+                task = future_to_task[future]
+                subset_key = task[0]
+                filename   = Path(task[3]).name
 
-                    # Use grayscale for scalar metrics
-                    up_gray = to_grayscale(up)
-
-                    mse      = compute_mse(orig_gray, up_gray)
-                    psnr     = compute_psnr(orig_gray, up_gray)
-                    ssim     = compute_ssim(orig_gray, up_gray)
-                    hf_ratio = compute_hf_ratio(img_f, up)
-
-                    results[subset][method_name][res].append(
-                        {"mse": mse, "psnr": psnr,
-                         "ssim": ssim, "hf_ratio": hf_ratio}
+                try:
+                    rows = future.result(timeout=timeout)
+                    if rows:
+                        append_image_rows(per_image_csv, rows)
+                    else:
+                        failed_images += 1
+                        logger.warning(
+                            f"No rows returned for {subset_key}/{filename}"
+                        )
+                except cf.TimeoutError:
+                    timed_out += 1
+                    logger.error(
+                        f"TIMEOUT ({timeout}s) {subset_key}/{filename} — skipped"
+                    )
+                    pbar.set_postfix_str(f"timeout: {filename[:20]}", refresh=True)
+                except Exception as exc:
+                    failed_images += 1
+                    logger.error(
+                        f"ERROR {subset_key}/{filename}: {exc}"
                     )
 
-    # Average over sampled images
-    for subset in results:
-        for method in results[subset]:
-            for res in results[subset][method]:
-                records = results[subset][method][res]
-                results[subset][method][res] = {
-                    k: float(np.mean([r[k] for r in records]))
-                    for k in ("mse", "psnr", "ssim", "hf_ratio")
-                }
-    return results
+                pbar.update(1)
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    issues = failed_images + timed_out
+    if issues:
+        print(
+            f"\n  {failed_images} image(s) failed, {timed_out} timed out. "
+            f"See {LOG_FILE} for details."
+        )
+    else:
+        print(f"\n  All images processed successfully.")
+
+    # ── Aggregate per-image → averaged ────────────────────────────────────────
+    print("\nAggregating results ...")
+    aggregate_to_averaged_csv(per_image_csv, averaged_csv)
+    logger.info(f"Averaged CSV written: {averaged_csv}")
+    print(f"  results_per_image.csv : {per_image_csv}")
+    print(f"  results_average.csv  : {averaged_csv}")
+
+    return averaged_csv
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Visualisation helpers
+# Terminal table  (reads from results_average.csv)
 # ──────────────────────────────────────────────────────────────────────────────
 
-METHOD_MARKERS = {"PointWise": "o", "Average": "s", "Fourier": "^"}
-DATASET_COLORS = ["#2E86AB", "#E07B39", "#6A994E", "#9B5DE5"]  # up to 4 datasets
+def _best_marker(values, higher_is_better: bool):
+    finite = [v for v in values if not math.isnan(v)]
+    if not finite:
+        return [" "] * len(values)
+    best = max(finite) if higher_is_better else min(finite)
+    return ["*" if (not math.isnan(v) and v == best) else " " for v in values]
+
+
+def print_detailed_tables(averaged_csv: Path):
+    """Print one formatted table per subset to the terminal."""
+    rows = []
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    subsets     = list(dict.fromkeys(r["subset"]          for r in rows))
+    methods     = list(dict.fromkeys(r["method"]          for r in rows))
+    resolutions = sorted(set(int(r["resolution"])         for r in rows))
+
+    cw  = {"res": 6, "method": 10, "psnr": 10, "ssim": 8, "mse": 12, "hf": 10}
+    sep = "-"
+    header = (
+        f"{'Res':>{cw['res']}}  {'Method':<{cw['method']}}"
+        f"  {'PSNR(dB)':>{cw['psnr']}}"
+        f"  {'SSIM':>{cw['ssim']}}"
+        f"  {'MSE':>{cw['mse']}}"
+        f"  {'HF Retain':>{cw['hf']}}"
+    )
+    width = len(header)
+
+    def _get(subset, method, res, key):
+        for r in rows:
+            if (r["subset"] == subset and r["method"] == method
+                    and int(r["resolution"]) == res):
+                v = r.get(key, "")
+                return float(v) if v else float("nan")
+        return float("nan")
+
+    for subset in sorted(subsets):
+        n = next((r["num_samples"] for r in rows if r["subset"] == subset), "?")
+        print(f"\n{'=' * width}")
+        print(f"  {subset}  (n={n})")
+        print(f"{'=' * width}")
+        print(header)
+        print(sep * width)
+
+        for res in resolutions:
+            pv = [_get(subset, m, res, "psnr")     for m in methods]
+            sv = [_get(subset, m, res, "ssim")     for m in methods]
+            mv = [_get(subset, m, res, "mse")      for m in methods]
+            hv = [_get(subset, m, res, "hf_ratio") for m in methods]
+
+            pm = _best_marker(pv, True)
+            sm = _best_marker(sv, True)
+            mm = _best_marker(mv, False)
+            hm = _best_marker(hv, True)
+
+            for i, method in enumerate(methods):
+                rc = str(res) if i == 0 else ""
+                p  = f"{pv[i]:.4f}" if not math.isnan(pv[i]) else "  nan  "
+                s  = f"{sv[i]:.4f}" if not math.isnan(sv[i]) else "  nan"
+                m  = f"{mv[i]:.6f}" if not math.isnan(mv[i]) else "     nan   "
+                h  = f"{hv[i]:.4f}" if not math.isnan(hv[i]) else "  nan  "
+                print(
+                    f"{rc:>{cw['res']}}  {method:<{cw['method']}}"
+                    f"  {p:>{cw['psnr'] - 1}}{pm[i]}"
+                    f"  {s:>{cw['ssim'] - 1}}{sm[i]}"
+                    f"  {m:>{cw['mse']  - 1}}{mm[i]}"
+                    f"  {h:>{cw['hf']   - 1}}{hm[i]}"
+                )
+            print(sep * width)
+
+    print("\n* = best method for that metric at that resolution")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Plotting  (reads from results_average.csv — fully decoupled)
+# ──────────────────────────────────────────────────────────────────────────────
+
+METHOD_MARKERS     = {"PointWise": "o", "Average": "s", "Fourier": "^"}
+DATASET_COLORS     = ["#2E86AB", "#E07B39", "#6A994E", "#9B5DE5"]
 DATASET_LINESTYLES = ["-", "--", "-.", ":"]
 
 METRIC_LABELS = {
@@ -323,68 +752,53 @@ METRIC_LABELS = {
     "hf_ratio": "HF Energy Retention ↑",
 }
 
+DATASET_GROUPS = {
+    "MetalSet_ViaSet":     ["MetalSet", "ViaSet"],
+    "StdContact_StdMetal": ["StdContact", "StdMetal"],
+}
 
-def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
+
+def plot_metrics_from_csv(averaged_csv: str, save_dir: str = None):
     """
-    Read the CSV produced by save_results_csv() and generate one figure per
-    (datatype x dataset-group) combination.
+    Generate one figure per (datatype × dataset-group) from
+    results_average.csv.
 
-    Visual encoding:
-      Colour      → dataset        (primary comparison axis)
-      Marker shape → method        (secondary comparison axis)
-      Line style  → method         (redundant with marker, aids print/greyscale)
+    Visual encoding
+    ---------------
+    Colour      → dataset  (primary comparison axis)
+    Marker+line → method   (secondary axis, redundant for print/greyscale)
 
-    Parameters
-    ----------
-    csv_path : str
-        Path to the CSV file written by save_results_csv().
-    save_dir : str or None
-        Directory to save PNG files. If None, figures are only shown and not saved.
+    save_dir=None  → show only, do not save to disk
+    save_dir=<str> → save PNG files to that directory
     """
-    import csv
-
     if save_dir is not None:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load CSV ──────────────────────────────────────────────────────────────
     rows = []
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
             rows.append({
                 "dataset":     row["dataset"],
                 "datatype":    row["datatype"],
                 "resolution":  int(row["resolution"]),
                 "method":      row["method"],
-                "psnr":        float(row["psnr"]),
-                "ssim":        float(row["ssim"]),
-                "mse":         float(row["mse"]),
-                "hf_ratio":    float(row["hf_ratio"]),
-                "num_samples": int(row["num_samples"]),
+                "num_samples": row["num_samples"],
+                **{
+                    m: (float(row[m]) if row[m] else float("nan"))
+                    for m in ("psnr", "ssim", "mse", "hf_ratio")
+                },
             })
 
-    datatypes   = list(dict.fromkeys(r["datatype"]  for r in rows))
-    methods     = list(dict.fromkeys(r["method"]    for r in rows))
-    resolutions = sorted(set(r["resolution"] for r in rows))
+    datatypes   = list(dict.fromkeys(r["datatype"] for r in rows))
+    methods     = list(dict.fromkeys(r["method"]   for r in rows))
+    resolutions = sorted(set(r["resolution"]       for r in rows))
     metrics     = list(METRIC_LABELS.keys())
-
     num_samples = rows[0]["num_samples"] if rows else "?"
 
-    # Fixed dataset groupings — two figures per datatype
-    DATASET_GROUPS = {
-        "MetalSet_ViaSet":     ["MetalSet", "ViaSet"],
-        "StdContact_StdMetal": ["StdContact", "StdMetal"],
-    }
-
-    # Colour per dataset within each group (same colours reused across groups
-    # since the two groups never appear in the same figure)
     GROUP_COLORS = [DATASET_COLORS[0], DATASET_COLORS[1]]
+    method_ls    = {m: DATASET_LINESTYLES[i] for i, m in enumerate(methods)}
 
-    # Line style + marker are both keyed on method for redundant encoding
-    method_ls = {m: DATASET_LINESTYLES[i] for i, m in enumerate(methods)}
-
-    # ── One pair of figures per datatype ─────────────────────────────────────
     for datatype in datatypes:
         dt_rows = [r for r in rows if r["datatype"] == datatype]
 
@@ -395,33 +809,34 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
             dataset_color = {ds: GROUP_COLORS[i]
                              for i, ds in enumerate(group_datasets)}
 
-            fig, axes = plt.subplots(
-                2, 2, figsize=(14, 11),
-                constrained_layout=False,
-            )
-            fig.subplots_adjust(top=0.91, bottom=0.18, hspace=0.38, wspace=0.28)
+            fig, axes = plt.subplots(2, 2, figsize=(14, 11),
+                                     constrained_layout=False)
+            fig.subplots_adjust(top=0.91, bottom=0.18,
+                                hspace=0.38, wspace=0.28)
             axes = axes.flatten()
 
             for ax, metric in zip(axes, metrics):
                 for dataset in group_datasets:
                     color = dataset_color[dataset]
                     for method in methods:
-                        marker = METHOD_MARKERS.get(method, "o")
-                        ls     = method_ls[method]
-
                         values = []
                         for res in resolutions:
                             matching = [
                                 r[metric] for r in dt_rows
-                                if r["dataset"]     == dataset
-                                and r["method"]     == method
+                                if r["dataset"]    == dataset
+                                and r["method"]    == method
                                 and r["resolution"] == res
+                                and not math.isnan(r[metric])
                             ]
-                            values.append(np.mean(matching) if matching else np.nan)
-
+                            values.append(
+                                float(np.mean(matching))
+                                if matching else float("nan")
+                            )
                         ax.plot(
                             resolutions, values,
-                            color=color, linestyle=ls, marker=marker,
+                            color=color,
+                            linestyle=method_ls[method],
+                            marker=METHOD_MARKERS.get(method, "o"),
                             linewidth=2, markersize=6,
                             label="_nolegend_",
                         )
@@ -433,47 +848,37 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
                 ax.set_xticklabels([str(r) for r in resolutions], fontsize=8)
                 ax.grid(True, alpha=0.25, linestyle="--")
 
-            # ── Legend 1: Dataset (colour) ─────────────────────────────────────
+            # Legend 1: Dataset (colour)
             dataset_handles = [
-                plt.Line2D([0], [0],
-                           color=dataset_color[ds], linewidth=3, label=ds)
+                plt.Line2D([0], [0], color=dataset_color[ds],
+                           linewidth=3, label=ds)
                 for ds in group_datasets
             ]
-            legend_dataset = fig.legend(
-                handles=dataset_handles,
-                title="Dataset",
-                title_fontsize=10,
-                fontsize=9,
-                loc="lower left",
-                bbox_to_anchor=(0.04, 0.01),
-                ncol=len(group_datasets),
-                framealpha=0.9,
+            legend_ds = fig.legend(
+                handles=dataset_handles, title="Dataset",
+                title_fontsize=10, fontsize=9,
+                loc="lower left", bbox_to_anchor=(0.04, 0.01),
+                ncol=len(group_datasets), framealpha=0.9,
                 edgecolor="#aaaaaa",
             )
 
-            # ── Legend 2: Method (marker + line style, neutral colour) ──────────
+            # Legend 2: Method (marker + line style, neutral colour)
             method_handles = [
-                plt.Line2D([0], [0],
-                           color="#444444",
+                plt.Line2D([0], [0], color="#444444",
                            linestyle=method_ls[m],
                            marker=METHOD_MARKERS.get(m, "o"),
                            linewidth=2, markersize=7, label=m)
                 for m in methods
             ]
             fig.legend(
-                handles=method_handles,
-                title="Downsampling Method",
-                title_fontsize=10,
-                fontsize=9,
-                loc="lower right",
-                bbox_to_anchor=(0.96, 0.01),
-                ncol=len(methods),
-                framealpha=0.9,
+                handles=method_handles, title="Downsampling Method",
+                title_fontsize=10, fontsize=9,
+                loc="lower right", bbox_to_anchor=(0.96, 0.01),
+                ncol=len(methods), framealpha=0.9,
                 edgecolor="#aaaaaa",
             )
-            fig.add_artist(legend_dataset)
+            fig.add_artist(legend_ds)
 
-            # ── Title ──────────────────────────────────────────────────────────
             pretty_group = " & ".join(group_datasets)
             fig.suptitle(
                 f"Downsampling Study  |  Datatype: {datatype}  |  "
@@ -482,160 +887,106 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
             )
 
             if save_dir is not None:
-                out_path = save_dir / f"metrics_{datatype}_{group_name}.png"
-                plt.savefig(out_path, dpi=150, bbox_inches="tight")
-                print(f"  Saved: {out_path}")
+                out = save_dir / f"metrics_{datatype}_{group_name}.png"
+                plt.savefig(out, dpi=150, bbox_inches="tight")
+                print(f"  Saved: {out}")
 
             plt.show()
-
-METRIC_DISPLAY = {
-    "psnr":     ("PSNR (dB)", "higher"),
-    "ssim":     ("SSIM",      "higher"),
-    "mse":      ("MSE",       "lower"),
-    "hf_ratio": ("HF Retain", "higher"),
-}
-METRICS = list(METRIC_DISPLAY.keys())
-
-
-def _best_marker(values, higher_is_better: bool):
-    """Return '*' for the best value in a list, '' for the rest."""
-    best = max(values) if higher_is_better else min(values)
-    return ["*" if v == best else " " for v in values]
-
-
-def print_detailed_tables(results: dict):
-    """
-    Print one table per dataset-datatype (subset).
-
-    Layout per table
-    ----------------
-    Columns : Resolution | Method | PSNR | SSIM | MSE | HF Retain
-    Rows    : one per (resolution x method) combination
-    A '*' marks the best method for each metric at each resolution.
-    """
-    resolutions = sorted(next(iter(
-        next(iter(results.values())).values()
-    )).keys())
-
-    # Column widths
-    cw = {"res": 6, "method": 10, "psnr": 10, "ssim": 8, "mse": 12, "hf": 10}
-    sep = "-"
-
-    def _header_line():
-        return (f"{'Res':>{cw['res']}}  {'Method':<{cw['method']}}"
-                f"  {'PSNR(dB)':>{cw['psnr']}}"
-                f"  {'SSIM':>{cw['ssim']}}"
-                f"  {'MSE':>{cw['mse']}}"
-                f"  {'HF Retain':>{cw['hf']}}")
-
-    header = _header_line()
-    width = len(header)
-
-    for subset in sorted(results.keys()):
-        print(f"\n{'=' * width}")
-        print(f"  {subset}  (n={NUM_SAMPLES})")
-        print(f"{'=' * width}")
-        print(header)
-        print(sep * width)
-
-        for res in resolutions:
-            method_names = list(METHODS.keys())
-            psnr_vals = [results[subset][m][res]["psnr"]     for m in method_names]
-            ssim_vals = [results[subset][m][res]["ssim"]     for m in method_names]
-            mse_vals  = [results[subset][m][res]["mse"]      for m in method_names]
-            hf_vals   = [results[subset][m][res]["hf_ratio"] for m in method_names]
-
-            psnr_mark = _best_marker(psnr_vals, higher_is_better=True)
-            ssim_mark = _best_marker(ssim_vals, higher_is_better=True)
-            mse_mark  = _best_marker(mse_vals,  higher_is_better=False)
-            hf_mark   = _best_marker(hf_vals,   higher_is_better=True)
-
-            for i, method in enumerate(method_names):
-                res_col = str(res) if i == 0 else ""
-                print(
-                    f"{res_col:>{cw['res']}}  {method:<{cw['method']}}"
-                    f"  {psnr_vals[i]:>{cw['psnr'] - 1}.4f}{psnr_mark[i]}"
-                    f"  {ssim_vals[i]:>{cw['ssim'] - 1}.4f}{ssim_mark[i]}"
-                    f"  {mse_vals[i]:>{cw['mse'] - 1}.6f}{mse_mark[i]}"
-                    f"  {hf_vals[i]:>{cw['hf'] - 1}.4f}{hf_mark[i]}"
-                )
-            print(sep * width)
-
-    print(f"\n* = best method for that metric at that resolution")
-
-
-def save_results_csv(results: dict, save_dir: str = "resolution_study_output",
-                     num_samples: int = NUM_SAMPLES):
-    """
-    Save all evaluation results to a single CSV file.
-
-    Columns: subset, dataset, datatype, num_samples, resolution,
-             method, psnr, ssim, mse, hf_ratio
-    One row per (subset x resolution x method) combination.
-    """
-    import csv
-
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = save_dir / "resolution_study_results.csv"
-
-    resolutions = sorted(next(iter(
-        next(iter(results.values())).values()
-    )).keys())
-
-    fieldnames = [
-        "subset", "dataset", "datatype", "num_samples",
-        "resolution", "method",
-        "psnr", "ssim", "mse", "hf_ratio",
-    ]
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for subset in sorted(results.keys()):
-            parts = subset.split("-", 1)
-            dataset  = parts[0]
-            datatype = parts[1] if len(parts) > 1 else ""
-
-            for res in resolutions:
-                for method in METHODS:
-                    m = results[subset][method][res]
-                    writer.writerow({
-                        "subset":      subset,
-                        "dataset":     dataset,
-                        "datatype":    datatype,
-                        "num_samples": num_samples,
-                        "resolution":  res,
-                        "method":      method,
-                        "psnr":        round(m["psnr"],     6),
-                        "ssim":        round(m["ssim"],     6),
-                        "mse":         round(m["mse"],      6),
-                        "hf_ratio":    round(m["hf_ratio"], 6),
-                    })
-
-    print(f"\nCSV saved to: {csv_path}")
-    return csv_path
+            plt.close(fig)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entry point
+# CLI
 # ──────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Spatial resolution study for LithoBench.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--evaluate",   action="store_true",
+                   help="Run the parallel image-level evaluation.")
+    p.add_argument("--plot",       action="store_true",
+                   help="Generate plots from results_average.csv.")
+    p.add_argument("--tables",     action="store_true",
+                   help="Print per-subset metric tables to terminal.")
+    p.add_argument("--workers",    type=int, default=None,
+                   help="Worker processes (default: cpu_count - 1).")
+    p.add_argument("--timeout",    type=int, default=120,
+                   help="Per-image timeout in seconds (default: 120).")
+    p.add_argument("--force",      action="store_true",
+                   help="Delete existing CSVs and start fresh.")
+    p.add_argument("--save-plots", action="store_true",
+                   help="Save plot PNGs to the output directory.")
+    p.add_argument("--aggregate",  action="store_true",
+                   help="Re-aggregate results_per_image.csv into results_average.csv "
+                        "without re-running the evaluation.")
+    p.add_argument("--csv",        type=str, default=None,
+                   help="Override path to results_average.csv for "
+                        "--plot / --tables.")
+    return p.parse_args()
+
 
 if __name__ == "__main__":
-    # print("Loading dataset samples ...")
-    # data = load_data(DATA_DICT, number_of_samples=NUM_SAMPLES)
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
 
-    # print("\nRunning downsampling evaluation ...")
-    # results = evaluate_dataset(data, resolutions=TARGET_RESOLUTIONS)
+    args = parse_args()
 
-    save_dir = Path("resolution_study_output")
+    if not any([args.evaluate, args.plot, args.tables, args.aggregate]):
+        print("No action specified. Use --evaluate, --plot, --aggregate, or --tables.")
+        print("Run with --help for full usage.")
+        sys.exit(0)
 
-    # print_detailed_tables(results)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    setup_logging(LOG_FILE)
+    logger = get_logger()
+    averaged_csv = Path(args.csv) if args.csv else OUTPUT_DIR / "results_average.csv"
 
-    # save_results_csv(results, save_dir=str(save_dir),
-    #                  num_samples=NUM_SAMPLES)
+    logger.info(
+        f"Session start | evaluate={args.evaluate} | plot={args.plot} | "
+        f"tables={args.tables} | workers={args.workers} | "
+        f"timeout={args.timeout} | force={args.force} | "
+        f"averaged_csv={averaged_csv}"
+    )
 
-    print("\nGenerating metric plots ...")
-    csv_path = save_dir / "resolution_study_results.csv"
-    plot_metrics_from_csv(str(csv_path), save_dir=str(save_dir))
+    # ── Evaluation ────────────────────────────────────────────────────────────
+    if args.evaluate:
+        averaged_csv = run_evaluation(
+            data_dict   = DATA_DICT,
+            output_dir  = OUTPUT_DIR,
+            num_workers = args.workers,
+            force       = args.force,
+            timeout     = args.timeout,
+        )
+
+    # ── Standalone aggregation ────────────────────────────────────────────────
+    if args.aggregate:
+        per_image_csv = OUTPUT_DIR / "results_per_image.csv"
+        if not per_image_csv.exists():
+            print(f"results_per_image.csv not found at {per_image_csv}. "
+                  f"Run --evaluate first.")
+        else:
+            print("Aggregating results_per_image.csv ...")
+            aggregate_to_averaged_csv(per_image_csv, averaged_csv)
+            print(f"Done. results_average.csv written to: {averaged_csv}")
+            logger.info(f"Standalone aggregation complete: {averaged_csv}")
+
+    # ── Terminal tables ───────────────────────────────────────────────────────
+    if args.tables:
+        if not averaged_csv.exists():
+            print(f"results_average.csv not found. Run --evaluate first.")
+        else:
+            print_detailed_tables(averaged_csv)
+
+    # ── Plotting ──────────────────────────────────────────────────────────────
+    if args.plot:
+        if not averaged_csv.exists():
+            print(f"results_average.csv not found. Run --evaluate first.")
+        else:
+            print("\nGenerating plots ...")
+            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            plot_metrics_from_csv(str(averaged_csv), save_dir=save_dir)
+
+    logger.info("Session end")
