@@ -74,7 +74,7 @@ from skimage.transform import downscale_local_mean, resize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output_fourrier"
+OUTPUT_DIR   = PROJECT_ROOT / "/Users/noamfisher/Desktop/NF-Thesis/resolution_study_output_fourrier"
 LOG_FILE     = OUTPUT_DIR / "spatial_study.log"
 
 # Set to an integer to cap images per subset (useful for test runs).
@@ -549,9 +549,21 @@ def run_evaluation(
 
         files = sorted(f for f in path.iterdir() if f.is_file())
 
-        # Apply per-subset sample cap before filtering completed images
         if NUM_SAMPLES is not None:
-            files = random.sample(files, min(NUM_SAMPLES, len(files)))
+            # On resume: always include files already completed for this subset
+            # so they are recognised and skipped, then top up with new samples
+            # only if needed to reach NUM_SAMPLES total.
+            already_done_names = {
+                fname for (sub, fname) in completed if sub == subset_key
+            }
+            already_done_files = [f for f in files if f.name in already_done_names]
+            remaining_files    = [f for f in files if f.name not in already_done_names]
+
+            still_needed = max(0, NUM_SAMPLES - len(already_done_files))
+            new_sample   = random.sample(
+                remaining_files, min(still_needed, len(remaining_files))
+            )
+            files = already_done_files + new_sample
 
         subset_sizes[subset_key] = len(files)
 
