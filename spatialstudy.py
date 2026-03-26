@@ -312,10 +312,8 @@ def evaluate_dataset(data: dict,
 # Visualisation helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-METHOD_COLORS = {"PointWise": "#E74C3C", "Average": "#2ECC71", "Fourier": "#3498DB"}
 METHOD_MARKERS = {"PointWise": "o", "Average": "s", "Fourier": "^"}
-
-# Line styles cycle across datasets so overlapping methods stay distinguishable
+DATASET_COLORS = ["#2E86AB", "#E07B39", "#6A994E", "#9B5DE5"]  # up to 4 datasets
 DATASET_LINESTYLES = ["-", "--", "-.", ":"]
 
 METRIC_LABELS = {
@@ -329,18 +327,25 @@ METRIC_LABELS = {
 def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
     """
     Read the CSV produced by save_results_csv() and generate one figure per
-    datatype.  Each figure has a 2×2 grid of metric subplots.
+    (datatype x dataset-group) combination.
 
-    Visual encoding — two separate legends, one concept each:
-      Legend 1 (Method)  : colour + marker shape
-      Legend 2 (Dataset) : line style only, all in neutral grey
+    Visual encoding:
+      Colour      → dataset        (primary comparison axis)
+      Marker shape → method        (secondary comparison axis)
+      Line style  → method         (redundant with marker, aids print/greyscale)
 
-    This separates the two dimensions completely so neither legend is
-    cluttered with the other dimension's information.
+    Parameters
+    ----------
+    csv_path : str
+        Path to the CSV file written by save_results_csv().
+    save_dir : str or None
+        Directory to save PNG files. If None, figures are only shown and not saved.
     """
     import csv
 
-
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load CSV ──────────────────────────────────────────────────────────────
     rows = []
@@ -360,7 +365,6 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
             })
 
     datatypes   = list(dict.fromkeys(r["datatype"]  for r in rows))
-    datasets    = list(dict.fromkeys(r["dataset"]   for r in rows))
     methods     = list(dict.fromkeys(r["method"]    for r in rows))
     resolutions = sorted(set(r["resolution"] for r in rows))
     metrics     = list(METRIC_LABELS.keys())
@@ -369,23 +373,27 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
 
     # Fixed dataset groupings — two figures per datatype
     DATASET_GROUPS = {
-        "MetalSet_ViaSet":       ["MetalSet", "ViaSet"],
-        "StdContact_StdMetal":   ["StdContact", "StdMetal"],
+        "MetalSet_ViaSet":     ["MetalSet", "ViaSet"],
+        "StdContact_StdMetal": ["StdContact", "StdMetal"],
     }
 
-    # Line style per dataset, consistent across all figures
-    all_grouped_datasets = [ds for grp in DATASET_GROUPS.values() for ds in grp]
-    dataset_ls = {ds: DATASET_LINESTYLES[i % len(DATASET_LINESTYLES)]
-                  for i, ds in enumerate(all_grouped_datasets)}
+    # Colour per dataset within each group (same colours reused across groups
+    # since the two groups never appear in the same figure)
+    GROUP_COLORS = [DATASET_COLORS[0], DATASET_COLORS[1]]
+
+    # Line style + marker are both keyed on method for redundant encoding
+    method_ls = {m: DATASET_LINESTYLES[i] for i, m in enumerate(methods)}
 
     # ── One pair of figures per datatype ─────────────────────────────────────
     for datatype in datatypes:
         dt_rows = [r for r in rows if r["datatype"] == datatype]
 
         for group_name, group_datasets in DATASET_GROUPS.items():
-            # Skip group if none of its datasets appear in this datatype's data
             if not any(r["dataset"] in group_datasets for r in dt_rows):
                 continue
+
+            dataset_color = {ds: GROUP_COLORS[i]
+                             for i, ds in enumerate(group_datasets)}
 
             fig, axes = plt.subplots(
                 2, 2, figsize=(14, 11),
@@ -396,10 +404,10 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
 
             for ax, metric in zip(axes, metrics):
                 for dataset in group_datasets:
-                    ls = dataset_ls[dataset]
+                    color = dataset_color[dataset]
                     for method in methods:
-                        color  = METHOD_COLORS.get(method, "#888888")
                         marker = METHOD_MARKERS.get(method, "o")
+                        ls     = method_ls[method]
 
                         values = []
                         for res in resolutions:
@@ -425,44 +433,45 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
                 ax.set_xticklabels([str(r) for r in resolutions], fontsize=8)
                 ax.grid(True, alpha=0.25, linestyle="--")
 
-            # ── Legend 1: Method (colour + marker) ────────────────────────────
-            method_handles = [
-                plt.Line2D([0], [0],
-                           color=METHOD_COLORS[m], marker=METHOD_MARKERS[m],
-                           linewidth=2, markersize=7, label=m)
-                for m in methods
-            ]
-            legend_method = fig.legend(
-                handles=method_handles,
-                title="Downsampling Method",
-                title_fontsize=10,
-                fontsize=9,
-                loc="lower left",
-                bbox_to_anchor=(0.04, 0.01),
-                ncol=len(methods),
-                framealpha=0.9,
-                edgecolor="#aaaaaa",
-            )
-
-            # ── Legend 2: Dataset (line style, neutral colour) ─────────────────
+            # ── Legend 1: Dataset (colour) ─────────────────────────────────────
             dataset_handles = [
                 plt.Line2D([0], [0],
-                           color="#444444", linestyle=dataset_ls[ds],
-                           linewidth=2, label=ds)
+                           color=dataset_color[ds], linewidth=3, label=ds)
                 for ds in group_datasets
             ]
-            fig.legend(
+            legend_dataset = fig.legend(
                 handles=dataset_handles,
                 title="Dataset",
                 title_fontsize=10,
                 fontsize=9,
-                loc="lower right",
-                bbox_to_anchor=(0.96, 0.01),
+                loc="lower left",
+                bbox_to_anchor=(0.04, 0.01),
                 ncol=len(group_datasets),
                 framealpha=0.9,
                 edgecolor="#aaaaaa",
             )
-            fig.add_artist(legend_method)
+
+            # ── Legend 2: Method (marker + line style, neutral colour) ──────────
+            method_handles = [
+                plt.Line2D([0], [0],
+                           color="#444444",
+                           linestyle=method_ls[m],
+                           marker=METHOD_MARKERS.get(m, "o"),
+                           linewidth=2, markersize=7, label=m)
+                for m in methods
+            ]
+            fig.legend(
+                handles=method_handles,
+                title="Downsampling Method",
+                title_fontsize=10,
+                fontsize=9,
+                loc="lower right",
+                bbox_to_anchor=(0.96, 0.01),
+                ncol=len(methods),
+                framealpha=0.9,
+                edgecolor="#aaaaaa",
+            )
+            fig.add_artist(legend_dataset)
 
             # ── Title ──────────────────────────────────────────────────────────
             pretty_group = " & ".join(group_datasets)
@@ -472,61 +481,12 @@ def plot_metrics_from_csv(csv_path: str, save_dir: str = None):
                 fontsize=12, fontweight="bold", y=0.97,
             )
 
-            if save_dir:
-                save_dir = Path(save_dir)
-                save_dir.mkdir(parents=True, exist_ok=True)
+            if save_dir is not None:
                 out_path = save_dir / f"metrics_{datatype}_{group_name}.png"
                 plt.savefig(out_path, dpi=150, bbox_inches="tight")
-
                 print(f"  Saved: {out_path}")
+
             plt.show()
-
-def plot_visual_comparison(data: dict,
-                           subset_key: str,
-                           resolutions: list = TARGET_RESOLUTIONS,
-                           image_index: int = 0,
-                           save_path: str = None):
-    """
-    Side-by-side visual comparison grid:
-      rows = methods, columns = resolutions.
-    Shows the actual downsampled images (not upscaled) so you can assess
-    visual quality at each target resolution directly.
-    """
-    img = data[subset_key][image_index].astype(np.float32)
-
-    n_methods = len(METHODS)
-    n_res = len(resolutions)
-
-    fig = plt.figure(figsize=(3 * (n_res + 1), 3 * (n_methods + 1)))
-    gs = gridspec.GridSpec(n_methods + 1, n_res + 1,
-                           hspace=0.05, wspace=0.05)
-
-    # Original (top-left column)
-    ax_orig = fig.add_subplot(gs[:, 0])
-    ax_orig.imshow(to_grayscale(img), cmap="gray",
-                   vmin=img.min(), vmax=img.max())
-    ax_orig.set_title("Original\n2048x2048", fontsize=9)
-    ax_orig.axis("off")
-
-    for row, (method_name, method_fn) in enumerate(METHODS.items()):
-        for col, res in enumerate(resolutions):
-            ds = method_fn(img, res)
-            ax = fig.add_subplot(gs[row, col + 1])
-            ax.imshow(to_grayscale(ds), cmap="gray")
-            if row == 0:
-                ax.set_title(f"{res}x{res}", fontsize=8)
-            if col == 0:
-                ax.set_ylabel(method_name, fontsize=8, rotation=90,
-                              labelpad=4)
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-    fig.suptitle(f"Visual Comparison — {subset_key}",
-                 fontsize=13, fontweight="bold", y=1.01)
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.show()
-
 
 METRIC_DISPLAY = {
     "psnr":     ("PSNR (dB)", "higher"),
