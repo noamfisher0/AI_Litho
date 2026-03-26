@@ -74,12 +74,12 @@ from skimage.transform import downscale_local_mean, resize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "/Users/noamfisher/Desktop/NF-Thesis/resolution_study_output_fourrier"
+OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output"
 LOG_FILE     = OUTPUT_DIR / "spatial_study.log"
 
 # Set to an integer to cap images per subset (useful for test runs).
 # Set to None to process every image in every subset.
-NUM_SAMPLES = 500
+NUM_SAMPLES = 100
 
 TARGET_RESOLUTIONS = [1024, 512, 256, 128]
 
@@ -121,7 +121,10 @@ PER_IMAGE_FIELDS = [
 AVERAGED_FIELDS = [
     "subset", "dataset", "datatype", "num_samples",
     "resolution", "method",
-    "psnr", "ssim", "mse", "hf_ratio",
+    "psnr", "psnr_std",
+    "ssim", "ssim_std",
+    "mse",  "mse_std",
+    "hf_ratio", "hf_ratio_std",
 ]
 
 
@@ -429,59 +432,65 @@ def append_image_rows(csv_path: Path, rows: list):
 def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
     """
     Read results_per_image.csv and write results_average.csv.
-    Computes the mean of each metric across all images for every
-    (subset × method × resolution) combination, ignoring nan values.
+    Computes mean and std of each metric independently per
+    (subset × method × resolution), ignoring nan/inf/empty values.
+    Each metric is accumulated independently so a nan in one metric
+    (e.g. PSNR for a perfect reconstruction) does not discard valid
+    values of other metrics for the same image.
     """
-    # Accumulate sums and counts independently per metric so that a nan in
-    # one metric (e.g. PSNR for a perfect reconstruction) does not discard
-    # the valid values of the other metrics (e.g. MSE=0.0) for that image.
     METRICS = ("psnr", "ssim", "mse", "hf_ratio")
-    sums   = {}   # (subset, method, res) → {metric: float}
-    counts = {}   # (subset, method, res) → {metric: int}
-    meta   = {}   # subset → (dataset, datatype)
+
+    # Store all valid values per (key, metric) to compute both mean and std
+    values = {}  # (subset, method, res) → {metric: [float, ...]}
+    meta   = {}  # subset → (dataset, datatype)
 
     with open(per_image_csv, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             key = (row["subset"], row["method"], int(row["resolution"]))
-            if key not in sums:
-                sums[key]   = {m: 0.0 for m in METRICS}
-                counts[key] = {m: 0   for m in METRICS}
+            if key not in values:
+                values[key] = {m: [] for m in METRICS}
                 meta[row["subset"]] = (row["dataset"], row["datatype"])
 
             for m in METRICS:
                 raw = row.get(m, "")
                 if raw == "" or raw is None:
-                    continue          # missing — skip this metric only
+                    continue
                 v = float(raw)
                 if math.isnan(v) or math.isinf(v):
-                    continue          # invalid — skip this metric only
-                sums[key][m]   += v
-                counts[key][m] += 1
+                    continue
+                values[key][m].append(v)
 
-    # Write averaged CSV — each metric averaged over its own valid count
     with open(averaged_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=AVERAGED_FIELDS)
         w.writeheader()
-        for (subset, method, res), s in sorted(sums.items()):
+        for (subset, method, res), vals in sorted(values.items()):
             dataset, datatype = meta[subset]
-            # Use the maximum valid count across metrics as num_samples
-            n = max(counts[(subset, method, res)].values())
+            n = max((len(vals[m]) for m in METRICS), default=0)
 
             def avg(m):
-                c = counts[(subset, method, res)][m]
-                return round(s[m] / c, 6) if c else ""
+                v = vals[m]
+                return round(float(np.mean(v)), 6) if v else ""
+
+            def std(m):
+                v = vals[m]
+                # ddof=1 for sample std; fall back to 0.0 for single-image subsets
+                return round(float(np.std(v, ddof=1 if len(v) > 1 else 0)), 6) if v else ""
 
             w.writerow({
-                "subset":      subset,
-                "dataset":     dataset,
-                "datatype":    datatype,
-                "num_samples": n,
-                "resolution":  res,
-                "method":      method,
-                "psnr":        avg("psnr"),
-                "ssim":        avg("ssim"),
-                "mse":         avg("mse"),
-                "hf_ratio":    avg("hf_ratio"),
+                "subset":       subset,
+                "dataset":      dataset,
+                "datatype":     datatype,
+                "num_samples":  n,
+                "resolution":   res,
+                "method":       method,
+                "psnr":         avg("psnr"),
+                "psnr_std":     std("psnr"),
+                "ssim":         avg("ssim"),
+                "ssim_std":     std("ssim"),
+                "mse":          avg("mse"),
+                "mse_std":      std("mse"),
+                "hf_ratio":     avg("hf_ratio"),
+                "hf_ratio_std": std("hf_ratio"),
             })
 
     return averaged_csv
@@ -908,6 +917,181 @@ def plot_metrics_from_csv(averaged_csv: str, save_dir: str = None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Single-metric plot with error bars
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Consistent colours per dataset — same across both plot functions
+SINGLE_METRIC_DATASET_COLORS = {
+    "MetalSet":   "#2E86AB",
+    "ViaSet":     "#E07B39",
+    "StdContact": "#2E86AB",   # same scheme reused within each group figure
+    "StdMetal":   "#E07B39",
+}
+
+SINGLE_METRIC_METHOD_MARKERS = {
+    "PointWise": "o",
+    "Average":   "s",
+    "Fourier":   "^",
+}
+
+VALID_METRICS = ("psnr", "ssim", "mse", "hf_ratio")
+
+METRIC_AXIS_LABELS = {
+    "psnr":     "PSNR (dB) ↑",
+    "ssim":     "SSIM ↑",
+    "mse":      "MSE ↓",
+    "hf_ratio": "HF Energy Retention ↑",
+}
+
+
+def plot_single_metric(
+    averaged_csv: str,
+    metric:       str,
+    save_dir:     str = None,
+):
+    """
+    One figure per (datatype × dataset-group), each figure contains 2 subplots
+    side by side — one per dataset in the group.
+
+    Visual encoding
+    ---------------
+    Colour  → dataset   (one colour per dataset within the group)
+    Marker  → method    (circle / square / triangle)
+    No line styles — markers only, connected by thin lines for readability
+    Error bars → ±1 std deviation across images in the subset
+
+    Parameters
+    ----------
+    averaged_csv : path to results_average.csv
+    metric       : one of psnr | ssim | mse | hf_ratio
+    save_dir     : directory to save PNGs, or None to show only
+    """
+    if metric not in VALID_METRICS:
+        raise ValueError(
+            f"Invalid metric '{metric}'. Choose from: {VALID_METRICS}"
+        )
+
+    std_col = f"{metric}_std"
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Load averaged CSV ─────────────────────────────────────────────────────
+    rows = []
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            mean_val = row.get(metric, "")
+            std_val  = row.get(std_col, "")
+            rows.append({
+                "subset":    row["subset"],
+                "dataset":   row["dataset"],
+                "datatype":  row["datatype"],
+                "method":    row["method"],
+                "resolution": int(row["resolution"]),
+                "num_samples": row.get("num_samples", "?"),
+                "mean": float(mean_val) if mean_val else float("nan"),
+                "std":  float(std_val)  if std_val  else float("nan"),
+            })
+
+    datatypes   = list(dict.fromkeys(r["datatype"]  for r in rows))
+    methods     = list(dict.fromkeys(r["method"]    for r in rows))
+    resolutions = sorted(set(r["resolution"]        for r in rows))
+
+    axis_label  = METRIC_AXIS_LABELS.get(metric, metric)
+
+    for datatype in datatypes:
+        dt_rows = [r for r in rows if r["datatype"] == datatype]
+
+        for group_name, group_datasets in DATASET_GROUPS.items():
+            if not any(r["dataset"] in group_datasets for r in dt_rows):
+                continue
+
+            fig, axes = plt.subplots(
+                1, 2, figsize=(13, 5),
+                constrained_layout=False,
+            )
+            fig.subplots_adjust(top=0.88, bottom=0.20,
+                                left=0.07, right=0.97, wspace=0.30)
+
+            for ax, dataset in zip(axes, group_datasets):
+                color = SINGLE_METRIC_DATASET_COLORS.get(dataset, "#888888")
+                ds_rows = [r for r in dt_rows if r["dataset"] == dataset]
+                n_label = ds_rows[0]["num_samples"] if ds_rows else "?"
+
+                for method in methods:
+                    marker = SINGLE_METRIC_METHOD_MARKERS.get(method, "o")
+                    means, stds = [], []
+
+                    for res in resolutions:
+                        match = [
+                            r for r in ds_rows
+                            if r["method"] == method
+                            and r["resolution"] == res
+                        ]
+                        if match and not math.isnan(match[0]["mean"]):
+                            means.append(match[0]["mean"])
+                            stds.append(
+                                match[0]["std"]
+                                if not math.isnan(match[0]["std"])
+                                else 0.0
+                            )
+                        else:
+                            means.append(float("nan"))
+                            stds.append(float("nan"))
+
+                    # Filter nans for plotting
+                    plot_res   = [r for r, m in zip(resolutions, means)
+                                  if not math.isnan(m)]
+                    plot_means = [m for m in means if not math.isnan(m)]
+                    plot_stds  = [s for s, m in zip(stds, means)
+                                  if not math.isnan(m)]
+
+                    if not plot_res:
+                        continue
+
+                    ax.errorbar(
+                        plot_res, plot_means,
+                        yerr=plot_stds,
+                        fmt=marker,             # marker only, no line style
+                        color=color,
+                        markersize=7,
+                        linewidth=1.2,          # thin connecting line only
+                        capsize=4,
+                        capthick=1.2,
+                        elinewidth=1.0,
+                        label=method,
+                    )
+
+                ax.set_title(
+                    f"{dataset}  (n={n_label})",
+                    fontsize=11, fontweight="bold",
+                )
+                ax.set_xlabel("Resolution (px)", fontsize=9)
+                ax.set_ylabel(axis_label, fontsize=9)
+                ax.set_xticks(resolutions)
+                ax.set_xticklabels([str(r) for r in resolutions], fontsize=8)
+                ax.grid(True, alpha=0.25, linestyle="--")
+                ax.legend(title="Method", fontsize=8, title_fontsize=9,
+                          framealpha=0.9, edgecolor="#aaaaaa")
+
+            pretty_group = " & ".join(group_datasets)
+            fig.suptitle(
+                f"{axis_label}  |  Datatype: {datatype}  |  "
+                f"Datasets: {pretty_group}",
+                fontsize=12, fontweight="bold", y=0.97,
+            )
+
+            if save_dir is not None:
+                out = save_dir / f"metric_{metric}_{datatype}_{group_name}.png"
+                plt.savefig(out, dpi=150, bbox_inches="tight")
+                print(f"  Saved: {out}")
+
+            plt.show()
+            plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -934,9 +1118,13 @@ def parse_args():
     p.add_argument("--aggregate",  action="store_true",
                    help="Re-aggregate results_per_image.csv into results_average.csv "
                         "without re-running the evaluation.")
+    p.add_argument("--plot-metric", type=str, default=None,
+                   metavar="METRIC",
+                   help=f"Plot a single metric with error bars. "
+                        f"Choose from: {VALID_METRICS}.")
     p.add_argument("--csv",        type=str, default=None,
                    help="Override path to results_average.csv for "
-                        "--plot / --tables.")
+                        "--plot / --tables / --plot-metric.")
     return p.parse_args()
 
 
@@ -946,8 +1134,10 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    if not any([args.evaluate, args.plot, args.tables, args.aggregate]):
-        print("No action specified. Use --evaluate, --plot, --aggregate, or --tables.")
+    if not any([args.evaluate, args.plot, args.tables,
+                args.aggregate, args.plot_metric]):
+        print("No action specified. Use --evaluate, --plot, --plot-metric,\n"
+              "--aggregate, or --tables.")
         print("Run with --help for full usage.")
         sys.exit(0)
 
@@ -1000,5 +1190,21 @@ if __name__ == "__main__":
             print("\nGenerating plots ...")
             save_dir = str(OUTPUT_DIR) if args.save_plots else None
             plot_metrics_from_csv(str(averaged_csv), save_dir=save_dir)
+
+    # ── Single-metric plot with error bars ───────────────────────────────────
+    if args.plot_metric:
+        metric = args.plot_metric.lower().strip()
+        if metric not in VALID_METRICS:
+            print(f"Unknown metric '{metric}'. "
+                  f"Choose from: {VALID_METRICS}")
+        elif not averaged_csv.exists():
+            print(f"results_average.csv not found. "
+                  f"Run --evaluate or --aggregate first.")
+        else:
+            print(f"\nGenerating single-metric plot for: {metric} ...")
+            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            plot_single_metric(str(averaged_csv),
+                               metric=metric,
+                               save_dir=save_dir)
 
     logger.info("Session end")
