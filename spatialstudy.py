@@ -83,7 +83,7 @@ from skimage.transform import downscale_local_mean, resize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output"
+OUTPUT_DIR   = PROJECT_ROOT / "resolution_study_output_final"
 LOG_FILE     = OUTPUT_DIR / "spatial_study.log"
 
 # Default sample cap — overridden at runtime by --samples flag.
