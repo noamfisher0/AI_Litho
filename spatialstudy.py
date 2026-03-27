@@ -308,6 +308,7 @@ def compute_hf_ratio(orig, recon, fft_size: int = 512) -> float:
 
 # Number of images processed per worker task — reduces IPC and CSV overhead
 BATCH_SIZE = 64
+ROW_BUFFER_LIMIT = 2000  # flush buffer to disk every N rows
 
 
 def _process_batch(task: tuple):
@@ -614,11 +615,21 @@ def run_evaluation(
     failed_images = 0
     timed_out     = 0
 
+    def _flush_buffer(buf, path):
+        """Write buffered rows to disk and clear the buffer."""
+        if buf:
+            append_image_rows(path, buf)
+            buf.clear()
+
     with cf.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit in chunks so the executor queue doesn't hold all futures
+        # in memory at once — important for very large datasets
         future_to_task = {
             executor.submit(_process_batch, task): task
             for task in tasks
         }
+
+        row_buffer = []   # accumulate rows here before flushing to disk
 
         with tqdm.tqdm(
             total=pending_images,
@@ -636,7 +647,11 @@ def run_evaluation(
                     if result:
                         all_rows, completed_pairs = result
                         if all_rows:
-                            append_image_rows(per_image_csv, all_rows)
+                            row_buffer.extend(all_rows)
+                            # Flush to disk once buffer is large enough,
+                            # keeping individual write operations efficient
+                            if len(row_buffer) >= ROW_BUFFER_LIMIT:
+                                _flush_buffer(row_buffer, per_image_csv)
                     else:
                         failed_images += n_in_batch
                         logger.warning(f"Batch returned no results")
@@ -644,11 +659,17 @@ def run_evaluation(
                     timed_out += n_in_batch
                     logger.error(f"TIMEOUT batch of {n_in_batch} images -- skipped")
                     pbar.set_postfix_str("batch timeout", refresh=True)
+                    # Flush whatever we have so far on timeout — preserves progress
+                    _flush_buffer(row_buffer, per_image_csv)
                 except Exception as exc:
                     failed_images += n_in_batch
                     logger.error(f"ERROR in batch: {exc}")
 
                 pbar.update(n_in_batch)
+
+        # Final flush — write any remaining buffered rows
+        _flush_buffer(row_buffer, per_image_csv)
+        logger.info(f"Final buffer flush complete")
 
     issues = failed_images + timed_out
     if issues:

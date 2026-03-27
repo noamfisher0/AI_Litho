@@ -31,12 +31,20 @@ Flags
   --evaluate            run the parallel pixel density evaluation
   --aggregate           re-aggregate density_per_image.csv → density_averaged.csv
   --plot                generate histograms from density_per_image.csv
+  --plot-mean-std       generate mean±std comparison plots from density_averaged.csv
   --tables              print per-subset mean/std tables to terminal
+  --snr                 calculate and print SNR (mean/std) per subset
+  --snr-plot            generate bar plot of SNR from density_averaged.csv
   --workers N           number of worker processes (default: cpu_count - 1)
+  --batch-size N        images per worker task batch (default: 32)
   --samples N           cap images per subset (default: None = all images)
   --force               delete existing CSVs and start fresh
-  --save-plots          save histogram PNGs to the output directory
+  --save-plots          save plot PNGs to the output directory
   --bins N              number of histogram bins (default: 40)
+  --datatypes A B ...   restrict all plots to these datatypes (case-insensitive)
+                          e.g. --datatypes PixelILT Resist
+  --datasets A B ...    restrict all plots to these datasets (case-insensitive)
+                          e.g. --datasets MetalSet ViaSet
 
 Usage examples
 --------------
@@ -44,8 +52,11 @@ Usage examples
   python densitystudy.py --evaluate --workers 8 --samples 500
   python densitystudy.py --aggregate
   python densitystudy.py --plot --save-plots
+  python densitystudy.py --plot-mean-std --save-plots
+  python densitystudy.py --plot --datatypes PixelILT Resist --datasets MetalSet ViaSet
+  python densitystudy.py --snr-plot --datasets MetalSet StdMetal
   python densitystudy.py --evaluate --aggregate --plot
-  python densitystudy.py --evaluate --force --workers 8
+  python densitystudy.py --evaluate --force --workers 8 --batch-size 64
 """
 
 import argparse
@@ -62,6 +73,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 
@@ -253,6 +265,30 @@ def _process_image(task: tuple):
         return None
 
 
+def _process_image_batch(batch_tasks: list):
+    """
+    Compute pixel density for a batch of images in one worker call.
+
+    Parameters
+    ----------
+    batch_tasks : list of task tuples expected by _process_image
+
+    Returns
+    -------
+    tuple[list[dict], int]
+        Successful rows and number of failed items in the batch.
+    """
+    rows = []
+    failed = 0
+    for task in batch_tasks:
+        row = _process_image(task)
+        if row is None:
+            failed += 1
+        else:
+            rows.append(row)
+    return rows, failed
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Aggregation
 # ──────────────────────────────────────────────────────────────────────────────
@@ -304,6 +340,7 @@ def run_evaluation(
     output_dir:  Path,
     num_workers: int  = None,
     num_samples: int  = None,
+    batch_size:  int  = 32,
     force:       bool = False,
     timeout:     int  = 60,
 ):
@@ -377,21 +414,30 @@ def run_evaluation(
     if num_workers is None:
         num_workers = max(1, os.cpu_count() - 1)
     num_workers = min(num_workers, pending)
+    batch_size = max(1, int(batch_size))
+
+    batched_tasks = [
+        tasks[i:i + batch_size]
+        for i in range(0, len(tasks), batch_size)
+    ]
 
     logger.info(
         f"Starting evaluation | images={pending} | "
-        f"workers={num_workers} | timeout={timeout}s"
+        f"workers={num_workers} | batch_size={batch_size} | timeout={timeout}s"
     )
-    print(f"Workers: {num_workers}  |  Images to process: {pending}\n")
+    print(
+        f"Workers: {num_workers}  |  Images: {pending}  |  "
+        f"Batch size: {batch_size} ({len(batched_tasks)} batches)\n"
+    )
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
     failed   = 0
     timedout = 0
 
     with cf.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        future_to_task = {
-            executor.submit(_process_image, task): task
-            for task in tasks
+        future_to_batch = {
+            executor.submit(_process_image_batch, batch): batch
+            for batch in batched_tasks
         }
 
         with tqdm.tqdm(
@@ -401,29 +447,34 @@ def run_evaluation(
             dynamic_ncols=True,
             file=sys.stdout,
         ) as pbar:
-            for future in cf.as_completed(future_to_task):
-                task      = future_to_task[future]
-                subset_key = task[0]
-                filename   = Path(task[3]).name
+            for future in cf.as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                first_subset = batch[0][0]
+                first_file = Path(batch[0][3]).name
+                batch_timeout = max(timeout, timeout * len(batch))
 
                 try:
-                    row = future.result(timeout=timeout)
-                    if row:
-                        append_image_rows(per_image_csv, [row])
-                    else:
-                        failed += 1
-                        logger.warning(f"No result for {subset_key}/{filename}")
+                    rows, batch_failed = future.result(timeout=batch_timeout)
+                    if rows:
+                        append_image_rows(per_image_csv, rows)
+                    failed += batch_failed
                 except cf.TimeoutError:
-                    timedout += 1
+                    timedout += len(batch)
                     logger.error(
-                        f"TIMEOUT ({timeout}s) {subset_key}/{filename} — skipped"
+                        f"TIMEOUT ({batch_timeout}s) batch starting "
+                        f"{first_subset}/{first_file} — skipped {len(batch)} images"
                     )
-                    pbar.set_postfix_str(f"timeout: {filename[:20]}", refresh=True)
+                    pbar.set_postfix_str(
+                        f"timeout batch: {first_file[:20]}",
+                        refresh=True,
+                    )
                 except Exception as exc:
-                    failed += 1
-                    logger.error(f"ERROR {subset_key}/{filename}: {exc}")
+                    failed += len(batch)
+                    logger.error(
+                        f"ERROR batch starting {first_subset}/{first_file}: {exc}"
+                    )
 
-                pbar.update(1)
+                pbar.update(len(batch))
 
     # ── Summary ───────────────────────────────────────────────────────────────
     issues = failed + timedout
@@ -484,7 +535,7 @@ def print_tables(averaged_csv: Path):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Plotting  (reads from density_per_image.csv)
+# Plotting helpers — filter & ordering
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Consistent colour per dataset
@@ -496,11 +547,49 @@ DATASET_COLORS = {
 }
 DEFAULT_COLOR = "#888888"
 
+# Canonical display order for datasets across all plots
+DATASET_ORDER = ["MetalSet", "ViaSet", "StdMetal", "StdContact"]
+
+
+def _resolve_filters(datatypes_arg, datasets_arg):
+    """
+    Normalise --datatypes / --datasets CLI values to lowercase sets.
+    Returns (dt_filter, ds_filter) where either may be None (= no filter).
+    """
+    dt_filter = {d.lower() for d in datatypes_arg} if datatypes_arg else None
+    ds_filter = {d.lower() for d in datasets_arg}  if datasets_arg  else None
+    return dt_filter, ds_filter
+
+
+def _apply_dataset_filter_and_order(datasets: list, ds_filter) -> list:
+    """
+    Apply optional dataset filter then sort by DATASET_ORDER.
+    Any dataset not in DATASET_ORDER is appended at the end, alphabetically.
+    """
+    if ds_filter is not None:
+        datasets = [ds for ds in datasets if ds.lower() in ds_filter]
+    known   = [ds for ds in DATASET_ORDER if ds in datasets]
+    unknown = sorted(ds for ds in datasets if ds not in DATASET_ORDER)
+    return known + unknown
+
+
+def _apply_datatype_filter(datatypes: list, dt_filter) -> list:
+    """Apply optional datatype filter (case-insensitive). Preserves existing order."""
+    if dt_filter is None:
+        return datatypes
+    return [dt for dt in datatypes if dt.lower() in dt_filter]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Plotting  (reads from density_per_image.csv)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def plot_density_histograms(
     per_image_csv: str,
-    bins:      int  = 40,
-    save_dir:  str  = None,
+    bins:          int  = 40,
+    save_dir:      str  = None,
+    dt_filter:     set  = None,
+    ds_filter:     set  = None,
 ):
     """
     Generate one figure per datatype.  Each figure contains one subplot per
@@ -511,6 +600,8 @@ def plot_density_histograms(
 
     save_dir=None  → show only
     save_dir=<str> → save PNG files to that directory
+    dt_filter      → set of lowercase datatype strings to include, or None for all
+    ds_filter      → set of lowercase dataset strings to include, or None for all
     """
     if save_dir is not None:
         save_dir = Path(save_dir)
@@ -529,12 +620,13 @@ def plot_density_histograms(
             key = (row["dataset"], row["datatype"])
             records.setdefault(key, []).append(fv)
 
-    # ── Derive ordered dimension lists ────────────────────────────────────────
-    datatypes = sorted(set(dt for _, dt in records.keys()))
-    datasets  = sorted(set(ds for ds, _ in records.keys()))
+    # ── Derive filtered + ordered dimension lists ─────────────────────────────
+    datatypes = _apply_datatype_filter(
+        sorted(set(dt for _, dt in records.keys())), dt_filter)
+    datasets  = _apply_dataset_filter_and_order(
+        list(set(ds for ds, _ in records.keys())), ds_filter)
 
     for datatype in datatypes:
-        # Collect datasets that have data for this datatype
         active = [ds for ds in datasets if (ds, datatype) in records]
         if not active:
             continue
@@ -587,6 +679,210 @@ def plot_density_histograms(
         plt.close(fig)
 
 
+def plot_mean_std_by_datatype(
+    averaged_csv: str,
+    save_dir:     str = None,
+    dt_filter:    set = None,
+    ds_filter:    set = None,
+):
+    """
+    Generate one figure per datatype with dataset mean density and std error bars.
+
+    Each datatype gets its own plot, where x-axis is dataset and y-axis is
+    mean density with ±std shown as error bars.
+
+    dt_filter / ds_filter: sets of lowercase strings to include, or None for all.
+    """
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    records = []
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            records.append(
+                {
+                    "subset":   row["subset"],
+                    "dataset":  row["dataset"],
+                    "datatype": row["datatype"],
+                    "mean":     float(row["mean_density"]),
+                    "std":      float(row["std_density"]),
+                    "n":        int(row["num_samples"]),
+                }
+            )
+
+    if not records:
+        print("No averaged rows available to plot.")
+        return
+
+    # ── Filter datatypes and datasets ─────────────────────────────────────────
+    datatypes = _apply_datatype_filter(
+        sorted({r["datatype"] for r in records}), dt_filter)
+    all_datasets = list({r["dataset"] for r in records})
+
+    for datatype in datatypes:
+        rows = [r for r in records if r["datatype"] == datatype]
+        if not rows:
+            continue
+
+        # Filter and order datasets to only those present for this datatype
+        present_datasets = _apply_dataset_filter_and_order(
+            [r["dataset"] for r in rows], ds_filter)
+        rows = [r for r in rows if r["dataset"] in present_datasets]
+        # Re-sort rows by canonical dataset order
+        rows.sort(key=lambda r: present_datasets.index(r["dataset"]))
+
+        if not rows:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = np.arange(len(rows))
+
+        for i, row in enumerate(rows):
+            color = DATASET_COLORS.get(row["dataset"], DEFAULT_COLOR)
+            ax.errorbar(
+                x[i],
+                row["mean"],
+                yerr=row["std"],
+                fmt="o",
+                color=color,
+                ecolor=color,
+                elinewidth=2,
+                capsize=6,
+                markersize=8,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([r["dataset"] for r in rows], rotation=25, ha="right")
+        ax.set_ylabel("Mean Pixel Density")
+        ax.set_xlabel("Dataset")
+        ax.set_title(f"Mean ± Std Pixel Density by Dataset | Datatype: {datatype}")
+        ax.grid(True, axis="y", alpha=0.25, linestyle="--")
+        ax.margins(x=0.08)
+
+        for i, row in enumerate(rows):
+            ax.text(
+                x[i],
+                row["mean"] + row["std"] + 0.005,
+                f"n={row['n']}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        plt.tight_layout()
+
+        if save_dir is not None:
+            out = Path(save_dir) / f"mean_std_{datatype}.png"
+            plt.savefig(out, dpi=150, bbox_inches="tight")
+            print(f"  Saved: {out}")
+
+        plt.show()
+        plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SNR
+# ──────────────────────────────────────────────────────────────────────────────
+
+def calculate_snr(output_dir: Path) -> list:
+    """Compute SNR = mean/std per (dataset, datatype) from density_averaged.csv.
+
+    Returns a list of dicts with keys: dataset, datatype, snr.
+    Rows where std == 0 are skipped to avoid division by zero.
+    Only (dataset, datatype) combinations present in the CSV are included.
+    """
+    averaged_csv = output_dir / "density_averaged.csv"
+    df = pd.read_csv(averaged_csv)
+
+    snr_results = []
+    for _, row in df.iterrows():
+        std = float(row["std_density"])
+        if std == 0:
+            continue
+        snr_results.append({
+            "dataset":  row["dataset"],
+            "datatype": row["datatype"],
+            "snr":      float(row["mean_density"]) / std,
+        })
+
+    return snr_results
+
+
+def bar_plot_snr(
+    snr_results: list,
+    save_dir:    str = None,
+    dt_filter:   set = None,
+    ds_filter:   set = None,
+):
+    """
+    Bar chart of SNR grouped by datatype, with one bar per dataset.
+    Datasets are ordered by DATASET_ORDER; bars are placed side-by-side.
+
+    dt_filter / ds_filter: sets of lowercase strings to include, or None for all.
+    """
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    if not snr_results:
+        print("No SNR results to plot.")
+        return
+
+    df_snr = pd.DataFrame(snr_results)
+
+    datatypes = _apply_datatype_filter(
+        sorted(df_snr["datatype"].unique()), dt_filter)
+    datasets  = _apply_dataset_filter_and_order(
+        list(df_snr["dataset"].unique()), ds_filter)
+
+    if not datatypes or not datasets:
+        print("No data remaining after applying filters.")
+        return
+
+    n_ds   = len(datasets)
+    n_dt   = len(datatypes)
+    width  = 0.8 / n_ds
+    x      = np.arange(n_dt)
+
+    fig, ax = plt.subplots(figsize=(max(8, n_dt * 1.5), 6))
+
+    for i, ds in enumerate(datasets):
+        df_ds  = df_snr[df_snr["dataset"] == ds].set_index("datatype")
+        values = [float(df_ds.loc[dt, "snr"]) if dt in df_ds.index else 0.0
+                  for dt in datatypes]
+        offsets = x - 0.4 + (i + 0.5) * width
+        color   = DATASET_COLORS.get(ds, DEFAULT_COLOR)
+        bars    = ax.bar(offsets, values, width=width * 0.9,
+                         label=ds, color=color, alpha=0.85, edgecolor="white")
+
+        for bar, val in zip(bars, values):
+            if val > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.3,
+                    f"{val:.1f}",
+                    ha="center", va="bottom", fontsize=7,
+                )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(datatypes, rotation=40, ha="right")
+    ax.set_xlabel("Datatype")
+    ax.set_ylabel("SNR  (mean / std)")
+    ax.set_title("Signal-to-Noise Ratio by Dataset and Datatype")
+    ax.legend(title="Dataset", framealpha=0.85)
+    ax.grid(True, axis="y", alpha=0.25, linestyle="--")
+    plt.tight_layout()
+
+    if save_dir is not None:
+        out = Path(save_dir) / "snr_bar_plot.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {out}")
+
+    plt.show()
+    plt.close(fig)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -597,26 +893,40 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--evaluate",   action="store_true",
+    p.add_argument("--evaluate",      action="store_true",
                    help="Run the parallel pixel density evaluation.")
-    p.add_argument("--aggregate",  action="store_true",
+    p.add_argument("--aggregate",     action="store_true",
                    help="Re-aggregate density_per_image.csv → density_averaged.csv.")
-    p.add_argument("--plot",       action="store_true",
+    p.add_argument("--plot",          action="store_true",
                    help="Generate density histograms from density_per_image.csv.")
-    p.add_argument("--tables",     action="store_true",
+    p.add_argument("--plot-mean-std", action="store_true",
+                   help="Generate mean±std comparison plots per datatype from density_averaged.csv.")
+    p.add_argument("--tables",        action="store_true",
                    help="Print per-subset mean/std tables to terminal.")
-    p.add_argument("--workers",    type=int, default=None,
+    p.add_argument("--snr",           action="store_true",
+                   help="Calculate and print SNR (mean/std) from density_averaged.csv.")
+    p.add_argument("--snr-plot",      action="store_true",
+                   help="Generate bar plot of SNR from density_averaged.csv.")
+    p.add_argument("--workers",       type=int, default=None,
                    help="Worker processes (default: cpu_count - 1).")
-    p.add_argument("--samples",    type=int, default=None,
+    p.add_argument("--batch-size",    type=int, default=32,
+                   help="Images per worker task batch (default: 32).")
+    p.add_argument("--samples",       type=int, default=None,
                    help="Cap images per subset — None means all images.")
-    p.add_argument("--timeout",    type=int, default=60,
+    p.add_argument("--timeout",       type=int, default=60,
                    help="Per-image timeout in seconds (default: 60).")
-    p.add_argument("--force",      action="store_true",
+    p.add_argument("--force",         action="store_true",
                    help="Delete existing CSVs and start fresh.")
-    p.add_argument("--save-plots", action="store_true",
-                   help="Save histogram PNGs to the output directory.")
-    p.add_argument("--bins",       type=int, default=40,
+    p.add_argument("--save-plots",    action="store_true",
+                   help="Save plot PNGs to the output directory.")
+    p.add_argument("--bins",          type=int, default=40,
                    help="Number of histogram bins (default: 40).")
+    p.add_argument("--datatypes",     nargs="+", default=None, metavar="DATATYPE",
+                   help="Restrict all plots to these datatypes (case-insensitive). "
+                        "E.g. --datatypes PixelILT Resist")
+    p.add_argument("--datasets",      nargs="+", default=None, metavar="DATASET",
+                   help="Restrict all plots to these datasets (case-insensitive). "
+                        "E.g. --datasets MetalSet ViaSet")
     return p.parse_args()
 
 
@@ -626,8 +936,10 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    if not any([args.evaluate, args.aggregate, args.plot, args.tables]):
-        print("No action specified. Use --evaluate, --aggregate, --plot, or --tables.")
+    if not any([args.evaluate, args.aggregate, args.plot, args.plot_mean_std,
+                args.tables, args.snr, args.snr_plot]):
+        print("No action specified. Use --evaluate, --aggregate, --plot, "
+              "--plot-mean-std, --tables, --snr, or --snr-plot.")
         print("Run with --help for full usage.")
         sys.exit(0)
 
@@ -638,10 +950,16 @@ if __name__ == "__main__":
     per_image_csv = OUTPUT_DIR / "density_per_image.csv"
     averaged_csv  = OUTPUT_DIR / "density_averaged.csv"
 
+    # Resolve filters once; pass to every plot function
+    dt_filter, ds_filter = _resolve_filters(args.datatypes, args.datasets)
+
     logger.info(
         f"Session start | evaluate={args.evaluate} | aggregate={args.aggregate} | "
-        f"plot={args.plot} | tables={args.tables} | workers={args.workers} | "
-        f"samples={args.samples} | force={args.force}"
+        f"plot={args.plot} | plot_mean_std={args.plot_mean_std} | "
+        f"tables={args.tables} | snr={args.snr} | snr_plot={args.snr_plot} | "
+        f"workers={args.workers} | batch_size={args.batch_size} | "
+        f"samples={args.samples} | force={args.force} | "
+        f"datatypes={args.datatypes} | datasets={args.datasets}"
     )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
@@ -652,6 +970,7 @@ if __name__ == "__main__":
             output_dir  = OUTPUT_DIR,
             num_workers = args.workers,
             num_samples = num_samples,
+            batch_size  = args.batch_size,
             force       = args.force,
             timeout     = args.timeout,
         )
@@ -659,7 +978,7 @@ if __name__ == "__main__":
     # ── Standalone aggregation ────────────────────────────────────────────────
     if args.aggregate:
         if not per_image_csv.exists():
-            print(f"density_per_image.csv not found. Run --evaluate first.")
+            print("density_per_image.csv not found. Run --evaluate first.")
         else:
             print("Aggregating density_per_image.csv ...")
             aggregate_to_averaged_csv(per_image_csv, averaged_csv)
@@ -683,8 +1002,56 @@ if __name__ == "__main__":
             save_dir = str(OUTPUT_DIR) if args.save_plots else None
             plot_density_histograms(
                 str(per_image_csv),
-                bins=args.bins,
-                save_dir=save_dir,
+                bins      = args.bins,
+                save_dir  = save_dir,
+                dt_filter = dt_filter,
+                ds_filter = ds_filter,
+            )
+
+    # ── Mean/std comparison plotting ──────────────────────────────────────────
+    if args.plot_mean_std:
+        if not averaged_csv.exists():
+            print("density_averaged.csv not found. Run --evaluate or --aggregate first.")
+        else:
+            print("\nGenerating mean±std comparison plots ...")
+            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            plot_mean_std_by_datatype(
+                str(averaged_csv),
+                save_dir  = save_dir,
+                dt_filter = dt_filter,
+                ds_filter = ds_filter,
+            )
+
+    # ── SNR ───────────────────────────────────────────────────────────────────
+    if args.snr:
+        if not averaged_csv.exists():
+            print("density_averaged.csv not found. Run --evaluate or --aggregate first.")
+        else:
+            print("\nCalculating SNR from density_averaged.csv ...")
+            snr_results = calculate_snr(OUTPUT_DIR)
+            # Apply filters for terminal output too
+            for res in snr_results:
+                if dt_filter and res["datatype"].lower() not in dt_filter:
+                    continue
+                if ds_filter and res["dataset"].lower() not in ds_filter:
+                    continue
+                print(f"Dataset: {res['dataset']:12s}  "
+                      f"Datatype: {res['datatype']:12s}  "
+                      f"SNR: {res['snr']:.4f}")
+
+    # ── SNR plot ──────────────────────────────────────────────────────────────
+    if args.snr_plot:
+        if not averaged_csv.exists():
+            print("density_averaged.csv not found. Run --evaluate or --aggregate first.")
+        else:
+            snr_results = calculate_snr(OUTPUT_DIR)
+            print("\nGenerating SNR bar plot ...")
+            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            bar_plot_snr(
+                snr_results,
+                save_dir  = save_dir,
+                dt_filter = dt_filter,
+                ds_filter = ds_filter,
             )
 
     logger.info("Session end")
