@@ -28,23 +28,28 @@ Use --force to discard existing results and start fresh.
 
 Flags
 -----
-  --evaluate            run the parallel pixel density evaluation
-  --aggregate           re-aggregate density_per_image.csv → density_averaged.csv
-  --plot                generate histograms from density_per_image.csv
-  --plot-mean-std       generate mean±std comparison plots from density_averaged.csv
-  --tables              print per-subset mean/std tables to terminal
-  --snr                 calculate and print SNR (mean/std) per subset
-  --snr-plot            generate bar plot of SNR from density_averaged.csv
-  --workers N           number of worker processes (default: cpu_count - 1)
-  --batch-size N        images per worker task batch (default: 32)
-  --samples N           cap images per subset (default: None = all images)
-  --force               delete existing CSVs and start fresh
-  --save-plots          save plot PNGs to the output directory
-  --bins N              number of histogram bins (default: 40)
-  --datatypes A B ...   restrict all plots to these datatypes (case-insensitive)
-                          e.g. --datatypes PixelILT Resist
-  --datasets A B ...    restrict all plots to these datasets (case-insensitive)
-                          e.g. --datasets MetalSet ViaSet
+  --evaluate              run the parallel pixel density evaluation
+  --aggregate             re-aggregate density_per_image.csv → density_averaged.csv
+  --plot                  generate histograms from density_per_image.csv
+  --plot-mean-std         generate mean±std comparison plots from density_averaged.csv
+  --tables                print per-subset mean/std tables to terminal
+  --snr                   calculate and print SNR (mean/std) per subset
+  --snr-plot              generate bar plot of SNR from density_averaged.csv
+  --expansion             calculate and print per-tile expansion coefficient summary
+  --expansion-plot        generate mean±std expansion coefficient plot
+  --workers N             number of worker processes (default: cpu_count - 1)
+  --batch-size N          images per worker task batch (default: 32)
+  --samples N             cap images per subset (default: None = all images)
+  --force                 delete existing CSVs and start fresh
+  --save-plots            save plot PNGs to the output directory
+  --bins N                number of histogram bins (default: 40)
+  --datatypes A B ...     restrict all plots to these datatypes (case-insensitive)
+                            e.g. --datatypes PixelILT Resist
+  --datasets A B ...      restrict all plots to these datasets (case-insensitive)
+                            e.g. --datasets MetalSet ViaSet
+  --min-target-density F  floor for Target density when computing expansion
+                            coefficient — tiles at or below this are excluded
+                            (default: 1e-4)
 
 Usage examples
 --------------
@@ -55,6 +60,8 @@ Usage examples
   python densitystudy.py --plot-mean-std --save-plots
   python densitystudy.py --plot --datatypes PixelILT Resist --datasets MetalSet ViaSet
   python densitystudy.py --snr-plot --datasets MetalSet StdMetal
+  python densitystudy.py --expansion --expansion-plot --save-plots
+  python densitystudy.py --expansion-plot --datasets MetalSet StdMetal --save-plots
   python densitystudy.py --evaluate --aggregate --plot
   python densitystudy.py --evaluate --force --workers 8 --batch-size 64
 """
@@ -89,6 +96,10 @@ LOG_FILE     = OUTPUT_DIR / "density_study.log"
 
 # Cap images per subset for test runs — set to None for the full dataset
 NUM_SAMPLES = None
+
+# Floor for Target density when computing expansion coefficient.
+# Tiles at or below this value are excluded to avoid division instability.
+DEFAULT_MIN_TARGET_DENSITY = 1e-4
 
 DATA_DICT = {
     "MetalSet-Printed":    str(DATA_ROOT / "MetalSet"   / "printed"),
@@ -715,21 +726,17 @@ def plot_mean_std_by_datatype(
         print("No averaged rows available to plot.")
         return
 
-    # ── Filter datatypes and datasets ─────────────────────────────────────────
     datatypes = _apply_datatype_filter(
         sorted({r["datatype"] for r in records}), dt_filter)
-    all_datasets = list({r["dataset"] for r in records})
 
     for datatype in datatypes:
         rows = [r for r in records if r["datatype"] == datatype]
         if not rows:
             continue
 
-        # Filter and order datasets to only those present for this datatype
         present_datasets = _apply_dataset_filter_and_order(
             [r["dataset"] for r in rows], ds_filter)
         rows = [r for r in rows if r["dataset"] in present_datasets]
-        # Re-sort rows by canonical dataset order
         rows.sort(key=lambda r: present_datasets.index(r["dataset"]))
 
         if not rows:
@@ -884,6 +891,193 @@ def bar_plot_snr(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Expansion coefficient  (PixelILT density / Target density, per tile)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def calculate_expansion_coefficient(
+    per_image_csv:      Path,
+    min_target_density: float = DEFAULT_MIN_TARGET_DENSITY,
+) -> pd.DataFrame:
+    """
+    Compute per-tile expansion coefficient = PixelILT density / Target density.
+
+    Tiles where Target density <= min_target_density are excluded to avoid
+    division instability (near-empty tiles where ILT has no meaningful input).
+
+    Parameters
+    ----------
+    per_image_csv       : path to density_per_image.csv
+    min_target_density  : exclusion floor for Target density (default 1e-4)
+
+    Returns
+    -------
+    df_avg : DataFrame with columns:
+                 dataset, n, mean_exp, std_exp, median_exp, p25, p75
+             one row per dataset, ordered by DATASET_ORDER.
+    """
+    all_data = pd.read_csv(per_image_csv)
+
+    df_pixelilt = (
+        all_data[all_data["datatype"] == "PixelILT"]
+        [["dataset", "filename", "pixel_density"]]
+        .rename(columns={"pixel_density": "density_pixelilt"})
+    )
+    df_target = (
+        all_data[all_data["datatype"] == "Target"]
+        [["dataset", "filename", "pixel_density"]]
+        .rename(columns={"pixel_density": "density_target"})
+    )
+
+    # Join on (dataset, filename) — the only safe pairing key
+    df_paired = pd.merge(df_pixelilt, df_target,
+                         on=["dataset", "filename"], how="inner")
+
+    # Drop near-zero Target tiles
+    df_valid = df_paired[
+        df_paired["density_target"] > min_target_density
+    ].copy()
+
+    n_total   = len(df_paired)
+    n_dropped = n_total - len(df_valid)
+    print(f"  Expansion: {n_total:,} paired tiles, "
+          f"dropped {n_dropped:,} with Target density ≤ {min_target_density} "
+          f"({100 * n_dropped / max(n_total, 1):.1f}%)")
+
+    df_valid["exp_coeff"] = (
+        df_valid["density_pixelilt"] / df_valid["density_target"]
+    )
+
+    df_avg = (
+        df_valid.groupby("dataset")["exp_coeff"]
+        .agg(
+            n          = "count",
+            mean_exp   = "mean",
+            std_exp    = "std",
+            median_exp = "median",
+            p25        = lambda x: x.quantile(0.25),
+            p75        = lambda x: x.quantile(0.75),
+        )
+        .reset_index()
+    )
+
+    # Apply canonical dataset ordering
+    order  = [ds for ds in DATASET_ORDER if ds in df_avg["dataset"].values]
+    df_avg = (
+        df_avg.set_index("dataset")
+        .reindex(order)
+        .reset_index()
+    )
+
+    return df_avg
+
+
+def print_expansion_table(df_avg: pd.DataFrame):
+    """Print the expansion coefficient summary table to the terminal."""
+    cw = {"dataset": 12, "n": 8, "mean": 10, "std": 10,
+          "median": 10, "p25": 10, "p75": 10}
+    header = (
+        f"{'Dataset':<{cw['dataset']}}"
+        f"  {'N':>{cw['n']}}"
+        f"  {'Mean':>{cw['mean']}}"
+        f"  {'Std':>{cw['std']}}"
+        f"  {'Median':>{cw['median']}}"
+        f"  {'P25':>{cw['p25']}}"
+        f"  {'P75':>{cw['p75']}}"
+    )
+    width = len(header)
+    print(f"\n{'=' * width}")
+    print("  Expansion Coefficient  (PixelILT density / Target density)")
+    print(f"{'=' * width}")
+    print(header)
+    print("-" * width)
+    for _, row in df_avg.iterrows():
+        print(
+            f"{row['dataset']:<{cw['dataset']}}"
+            f"  {int(row['n']):>{cw['n']},}"
+            f"  {row['mean_exp']:>{cw['mean']}.4f}"
+            f"  {row['std_exp']:>{cw['std']}.4f}"
+            f"  {row['median_exp']:>{cw['median']}.4f}"
+            f"  {row['p25']:>{cw['p25']}.4f}"
+            f"  {row['p75']:>{cw['p75']}.4f}"
+        )
+    print("-" * width)
+
+
+def plot_expansion_coefficient(
+    df_avg:    pd.DataFrame,
+    save_dir:  str = None,
+    ds_filter: set = None,
+):
+    """
+    Plot mean ± std of the per-tile expansion coefficient for each dataset.
+
+    Parameters
+    ----------
+    df_avg    : output of calculate_expansion_coefficient()
+    save_dir  : directory to save PNG, or None to show only
+    ds_filter : set of lowercase dataset names to include, or None for all
+    """
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Apply optional dataset filter then re-order
+    datasets = _apply_dataset_filter_and_order(
+        list(df_avg["dataset"].values), ds_filter)
+    df_plt = (
+        df_avg[df_avg["dataset"].isin(datasets)]
+        .set_index("dataset")
+        .reindex(datasets)
+        .reset_index()
+    )
+
+    if df_plt.empty:
+        print("No data remaining after applying dataset filter.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(df_plt))
+
+    for i, row in df_plt.iterrows():
+        color = DATASET_COLORS.get(row["dataset"], DEFAULT_COLOR)
+        ax.errorbar(
+            x[i], row["mean_exp"],
+            yerr=row["std_exp"],
+            fmt="o",
+            color=color, ecolor=color,
+            elinewidth=2, capsize=6, markersize=9,
+            label=row["dataset"],
+        )
+        ax.text(
+            x[i],
+            row["mean_exp"] + row["std_exp"] + 0.05,
+            f"μ={row['mean_exp']:.2f}\nσ={row['std_exp']:.2f}\nn={int(row['n']):,}",
+            ha="center", va="bottom", fontsize=8, color=color,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(df_plt["dataset"], fontsize=11)
+    ax.set_ylabel("Expansion Coefficient  (PixelILT density / Target density)",
+                  fontsize=10)
+    ax.set_xlabel("Dataset", fontsize=10)
+    ax.set_title("Per-Tile ILT Expansion Coefficient  |  Mean ± Std by Dataset",
+                 fontsize=12)
+    ax.grid(True, axis="y", alpha=0.25, linestyle="--")
+    ax.margins(x=0.15)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+
+    if save_dir is not None:
+        out = Path(save_dir) / "expansion_coefficient.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {out}")
+
+    plt.show()
+    plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -893,40 +1087,49 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--evaluate",      action="store_true",
+    p.add_argument("--evaluate",           action="store_true",
                    help="Run the parallel pixel density evaluation.")
-    p.add_argument("--aggregate",     action="store_true",
+    p.add_argument("--aggregate",          action="store_true",
                    help="Re-aggregate density_per_image.csv → density_averaged.csv.")
-    p.add_argument("--plot",          action="store_true",
+    p.add_argument("--plot",               action="store_true",
                    help="Generate density histograms from density_per_image.csv.")
-    p.add_argument("--plot-mean-std", action="store_true",
-                   help="Generate mean±std comparison plots per datatype from density_averaged.csv.")
-    p.add_argument("--tables",        action="store_true",
+    p.add_argument("--plot-mean-std",      action="store_true",
+                   help="Generate mean±std comparison plots per datatype.")
+    p.add_argument("--tables",             action="store_true",
                    help="Print per-subset mean/std tables to terminal.")
-    p.add_argument("--snr",           action="store_true",
+    p.add_argument("--snr",                action="store_true",
                    help="Calculate and print SNR (mean/std) from density_averaged.csv.")
-    p.add_argument("--snr-plot",      action="store_true",
+    p.add_argument("--snr-plot",           action="store_true",
                    help="Generate bar plot of SNR from density_averaged.csv.")
-    p.add_argument("--workers",       type=int, default=None,
+    p.add_argument("--expansion",          action="store_true",
+                   help="Calculate and print per-tile expansion coefficient summary "
+                        "(PixelILT density / Target density).")
+    p.add_argument("--expansion-plot",     action="store_true",
+                   help="Generate mean±std expansion coefficient plot.")
+    p.add_argument("--workers",            type=int, default=None,
                    help="Worker processes (default: cpu_count - 1).")
-    p.add_argument("--batch-size",    type=int, default=32,
+    p.add_argument("--batch-size",         type=int, default=32,
                    help="Images per worker task batch (default: 32).")
-    p.add_argument("--samples",       type=int, default=None,
+    p.add_argument("--samples",            type=int, default=None,
                    help="Cap images per subset — None means all images.")
-    p.add_argument("--timeout",       type=int, default=60,
+    p.add_argument("--timeout",            type=int, default=60,
                    help="Per-image timeout in seconds (default: 60).")
-    p.add_argument("--force",         action="store_true",
+    p.add_argument("--force",              action="store_true",
                    help="Delete existing CSVs and start fresh.")
-    p.add_argument("--save-plots",    action="store_true",
+    p.add_argument("--save-plots",         action="store_true",
                    help="Save plot PNGs to the output directory.")
-    p.add_argument("--bins",          type=int, default=40,
+    p.add_argument("--bins",               type=int, default=40,
                    help="Number of histogram bins (default: 40).")
-    p.add_argument("--datatypes",     nargs="+", default=None, metavar="DATATYPE",
+    p.add_argument("--datatypes",          nargs="+", default=None, metavar="DATATYPE",
                    help="Restrict all plots to these datatypes (case-insensitive). "
                         "E.g. --datatypes PixelILT Resist")
-    p.add_argument("--datasets",      nargs="+", default=None, metavar="DATASET",
+    p.add_argument("--datasets",           nargs="+", default=None, metavar="DATASET",
                    help="Restrict all plots to these datasets (case-insensitive). "
                         "E.g. --datasets MetalSet ViaSet")
+    p.add_argument("--min-target-density", type=float,
+                   default=DEFAULT_MIN_TARGET_DENSITY,
+                   help="Exclusion floor for Target density when computing the "
+                        f"expansion coefficient (default: {DEFAULT_MIN_TARGET_DENSITY}).")
     return p.parse_args()
 
 
@@ -937,9 +1140,11 @@ if __name__ == "__main__":
     args = parse_args()
 
     if not any([args.evaluate, args.aggregate, args.plot, args.plot_mean_std,
-                args.tables, args.snr, args.snr_plot]):
+                args.tables, args.snr, args.snr_plot,
+                args.expansion, args.expansion_plot]):
         print("No action specified. Use --evaluate, --aggregate, --plot, "
-              "--plot-mean-std, --tables, --snr, or --snr-plot.")
+              "--plot-mean-std, --tables, --snr, --snr-plot, "
+              "--expansion, or --expansion-plot.")
         print("Run with --help for full usage.")
         sys.exit(0)
 
@@ -950,16 +1155,18 @@ if __name__ == "__main__":
     per_image_csv = OUTPUT_DIR / "density_per_image.csv"
     averaged_csv  = OUTPUT_DIR / "density_averaged.csv"
 
-    # Resolve filters once; pass to every plot function
+    # Resolve filters once; passed to every plot/print function
     dt_filter, ds_filter = _resolve_filters(args.datatypes, args.datasets)
 
     logger.info(
         f"Session start | evaluate={args.evaluate} | aggregate={args.aggregate} | "
         f"plot={args.plot} | plot_mean_std={args.plot_mean_std} | "
         f"tables={args.tables} | snr={args.snr} | snr_plot={args.snr_plot} | "
+        f"expansion={args.expansion} | expansion_plot={args.expansion_plot} | "
         f"workers={args.workers} | batch_size={args.batch_size} | "
         f"samples={args.samples} | force={args.force} | "
-        f"datatypes={args.datatypes} | datasets={args.datasets}"
+        f"datatypes={args.datatypes} | datasets={args.datasets} | "
+        f"min_target_density={args.min_target_density}"
     )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
@@ -1011,7 +1218,8 @@ if __name__ == "__main__":
     # ── Mean/std comparison plotting ──────────────────────────────────────────
     if args.plot_mean_std:
         if not averaged_csv.exists():
-            print("density_averaged.csv not found. Run --evaluate or --aggregate first.")
+            print("density_averaged.csv not found. "
+                  "Run --evaluate or --aggregate first.")
         else:
             print("\nGenerating mean±std comparison plots ...")
             save_dir = str(OUTPUT_DIR) if args.save_plots else None
@@ -1025,11 +1233,11 @@ if __name__ == "__main__":
     # ── SNR ───────────────────────────────────────────────────────────────────
     if args.snr:
         if not averaged_csv.exists():
-            print("density_averaged.csv not found. Run --evaluate or --aggregate first.")
+            print("density_averaged.csv not found. "
+                  "Run --evaluate or --aggregate first.")
         else:
             print("\nCalculating SNR from density_averaged.csv ...")
             snr_results = calculate_snr(OUTPUT_DIR)
-            # Apply filters for terminal output too
             for res in snr_results:
                 if dt_filter and res["datatype"].lower() not in dt_filter:
                     continue
@@ -1042,7 +1250,8 @@ if __name__ == "__main__":
     # ── SNR plot ──────────────────────────────────────────────────────────────
     if args.snr_plot:
         if not averaged_csv.exists():
-            print("density_averaged.csv not found. Run --evaluate or --aggregate first.")
+            print("density_averaged.csv not found. "
+                  "Run --evaluate or --aggregate first.")
         else:
             snr_results = calculate_snr(OUTPUT_DIR)
             print("\nGenerating SNR bar plot ...")
@@ -1053,5 +1262,30 @@ if __name__ == "__main__":
                 dt_filter = dt_filter,
                 ds_filter = ds_filter,
             )
+
+    # ── Expansion coefficient ─────────────────────────────────────────────────
+    # Both --expansion and --expansion-plot share a single calculation call
+    # so the CSV is only read once even when both flags are passed together.
+    if args.expansion or args.expansion_plot:
+        if not per_image_csv.exists():
+            print("density_per_image.csv not found. Run --evaluate first.")
+        else:
+            print("\nCalculating expansion coefficients ...")
+            df_exp = calculate_expansion_coefficient(
+                per_image_csv,
+                min_target_density=args.min_target_density,
+            )
+
+            if args.expansion:
+                print_expansion_table(df_exp)
+
+            if args.expansion_plot:
+                print("\nGenerating expansion coefficient plot ...")
+                save_dir = str(OUTPUT_DIR) if args.save_plots else None
+                plot_expansion_coefficient(
+                    df_exp,
+                    save_dir  = save_dir,
+                    ds_filter = ds_filter,
+                )
 
     logger.info("Session end")
