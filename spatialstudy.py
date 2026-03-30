@@ -171,6 +171,18 @@ def setup_logging(log_file: Path) -> logging.Logger:
         encoding="utf-8",
         mode="a",
     )
+
+    # Rename rotated backups from "spatial_study.log.i" to
+    # "spatial_study_log_i.log" while keeping the active file as spatial_study.log.
+    def _rotate_name(default_name: str) -> str:
+        path = Path(default_name)
+        if ".log." in path.name:
+            base, idx = path.name.rsplit(".log.", 1)
+            if idx.isdigit():
+                return str(path.with_name(f"{base}_log_{idx}.log"))
+        return default_name
+
+    fh.namer = _rotate_name
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     logger.addHandler(fh)

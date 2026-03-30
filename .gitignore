@@ -5,6 +5,11 @@ lithobench-main.zip
 LithoData/
 LithoModels/
 
+
+*.log
+*.log.*
+*.csv
+*.png
 ###############
 
 
