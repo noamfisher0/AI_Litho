@@ -765,7 +765,7 @@ def plot_mean_std_by_datatype(
                            fontsize=13)
         ax.set_ylabel("Mean Pixel Density", fontsize=13)
         ax.set_xlabel("Dataset", fontsize=13)
-        ax.set_title(f"Mean ± Std Pixel Density by Dataset | Datatype: {datatype}",
+        ax.set_title(f"Datatype: {datatype}",
                      fontsize=14, fontweight="bold")
         ax.tick_params(axis="y", labelsize=12)
         ax.grid(True, axis="y", alpha=0.25, linestyle="--")
@@ -1049,16 +1049,16 @@ def plot_expansion_coefficient(
         ax.text(
             x[i],
             row["mean_exp"] + row["std_exp"] + 0.05,
-            f"μ={row['mean_exp']:.2f}\nσ={row['std_exp']:.2f}\nn={int(row['n']):,}",
+            f"μ={row['mean_exp']:.2f}\nσ={row['std_exp']:.2f}",
             ha="center", va="bottom", fontsize=10, color=color,
         )
 
     ax.set_xticks(x)
     ax.set_xticklabels(df_plt["dataset"], fontsize=13)
-    ax.set_ylabel("Expansion Coefficient  (PixelILT density / Target density)",
+    ax.set_ylabel("Expansion Coefficient",
                   fontsize=13)
     ax.set_xlabel("Dataset", fontsize=13)
-    ax.set_title("Per-Tile ILT Expansion Coefficient  |  Mean ± Std by Dataset",
+    ax.set_title("ILT Expansion Coefficient",
                  fontsize=14, fontweight="bold")
     ax.tick_params(axis="y", labelsize=12)
     ax.grid(True, axis="y", alpha=0.25, linestyle="--")
