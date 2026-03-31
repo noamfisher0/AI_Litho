@@ -82,38 +82,38 @@ from skimage.transform import downscale_local_mean, resize
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR = PROJECT_ROOT / "resolution_study_output_fourrier_2k"
+OUTPUT_DIR = PROJECT_ROOT / "resolution_study_output_final"
 LOG_FILE = OUTPUT_DIR / "spatial_study.log"
 
 # Default sample cap — overridden at runtime by --samples flag.
 # None means process every image in every subset.
-NUM_SAMPLES = 2000
+NUM_SAMPLES = None
 
 TARGET_RESOLUTIONS = [1024, 512, 256, 128]
 
 DATA_DICT = {
-    "MetalSet-Printed": str(DATA_ROOT / "MetalSet" / "printed"),
-    "MetalSet-Resist": str(DATA_ROOT / "MetalSet" / "resist"),
-    "MetalSet-Target": str(DATA_ROOT / "MetalSet" / "target"),
-    "MetalSet-LevelILT": str(DATA_ROOT / "MetalSet" / "levelsetILT"),
-    "MetalSet-Litho": str(DATA_ROOT / "MetalSet" / "litho"),
-    "MetalSet-PixelILT": str(DATA_ROOT / "MetalSet" / "pixelILT"),
-    "ViaSet-Printed": str(DATA_ROOT / "ViaSet" / "printed"),
-    "ViaSet-Resist": str(DATA_ROOT / "ViaSet" / "resist"),
-    "ViaSet-Target": str(DATA_ROOT / "ViaSet" / "target"),
-    "ViaSet-LevelILT": str(DATA_ROOT / "ViaSet" / "levelsetILT"),
-    "ViaSet-Litho": str(DATA_ROOT / "ViaSet" / "litho"),
-    "ViaSet-PixelILT": str(DATA_ROOT / "ViaSet" / "pixelILT"),
-    "StdContact-Printed": str(DATA_ROOT / "StdContact" / "printed"),
-    "StdContact-Resist": str(DATA_ROOT / "StdContact" / "resist"),
-    "StdContact-Target": str(DATA_ROOT / "StdContact" / "target"),
-    "StdContact-Litho": str(DATA_ROOT / "StdContact" / "litho"),
-    "StdContact-PixelILT": str(DATA_ROOT / "StdContact" / "pixelILT"),
-    "StdMetal-Printed": str(DATA_ROOT / "StdMetal" / "printed"),
-    "StdMetal-Resist": str(DATA_ROOT / "StdMetal" / "resist"),
-    "StdMetal-Target": str(DATA_ROOT / "StdMetal" / "target"),
-    "StdMetal-Litho": str(DATA_ROOT / "StdMetal" / "litho"),
-    "StdMetal-PixelILT": str(DATA_ROOT / "StdMetal" / "pixelILT"),
+    "MetalSet-Printed":    str(DATA_ROOT / "MetalSet"   / "printed"),
+    "MetalSet-Resist":     str(DATA_ROOT / "MetalSet"   / "resist"),
+    "MetalSet-Target":     str(DATA_ROOT / "MetalSet"   / "target"),
+    "MetalSet-LevelILT":   str(DATA_ROOT / "MetalSet"   / "levelsetILT"),
+    "MetalSet-Litho":      str(DATA_ROOT / "MetalSet"   / "litho"),
+    "MetalSet-PixelILT":   str(DATA_ROOT / "MetalSet"   / "pixelILT"),
+    "ViaSet-Printed":      str(DATA_ROOT / "ViaSet"     / "printed"),
+    "ViaSet-Resist":       str(DATA_ROOT / "ViaSet"     / "resist"),
+    "ViaSet-Target":       str(DATA_ROOT / "ViaSet"     / "target"),
+    "ViaSet-LevelILT":     str(DATA_ROOT / "ViaSet"     / "levelsetILT"),
+    "ViaSet-Litho":        str(DATA_ROOT / "ViaSet"     / "litho"),
+    "ViaSet-PixelILT":     str(DATA_ROOT / "ViaSet"     / "pixelILT"),
+    "StdContact-Printed":  str(DATA_ROOT / "StdContactFull" / "printed"),
+    "StdContact-Resist":   str(DATA_ROOT / "StdContactFull" / "resist"),
+    "StdContact-Target":   str(DATA_ROOT / "StdContactFull" / "target"),
+    "StdContact-Litho":    str(DATA_ROOT / "StdContactFull" / "litho"),
+    "StdContact-PixelILT": str(DATA_ROOT / "StdContactFull" / "pixelILT"),
+    "StdMetal-Printed":    str(DATA_ROOT / "StdMetal"   / "printed"),
+    "StdMetal-Resist":     str(DATA_ROOT / "StdMetal"   / "resist"),
+    "StdMetal-Target":     str(DATA_ROOT / "StdMetal"   / "target"),
+    "StdMetal-Litho":      str(DATA_ROOT / "StdMetal"   / "litho"),
+    "StdMetal-PixelILT":   str(DATA_ROOT / "StdMetal"   / "pixelILT"),
 }
 
 # -- CSV schemas ---------------------------------------------------------------
@@ -1172,6 +1172,181 @@ def plot_single_metric(
         plt.close(fig)
 
 
+
+# ------------------------------------------------------------------------------
+# plot_visual_comparison  -- side-by-side original vs downsampled+upsampled
+# ------------------------------------------------------------------------------
+
+def plot_visual_comparison(
+    dataset: str,
+    datatype: str,
+    resolution: int,
+    methods: list = None,
+    show_reconstruction: bool = False,
+    save_dir: str = None,
+    seed: int = None,
+):
+    """
+    Pick one random image from the given dataset/datatype directory,
+    downsample it with each requested method to `resolution` px, then
+    display all versions side by side.
+
+    Parameters
+    ----------
+    dataset              : canonical dataset name, e.g. "MetalSet"
+    datatype             : canonical datatype name, e.g. "PixelILT"
+    resolution           : target downsampling resolution in pixels
+    methods              : list of canonical method names; defaults to all three
+    show_reconstruction  : if True, display the NN-upsampled reconstruction at
+                           native resolution instead of the downsampled image.
+                           Metrics are identical either way (always round-trip).
+    save_dir             : if set, saves the figure as a PNG here
+    seed                 : optional random seed for reproducible image selection
+    """
+    if methods is None:
+        methods = list(ALL_METHODS.keys())
+
+    # ── Resolve directory from DATA_DICT ──────────────────────────────────────
+    subset_key = f"{dataset}-{datatype}"
+    image_dir = DATA_DICT.get(subset_key)
+    if image_dir is None:
+        raise ValueError(
+            f"Unknown subset '{subset_key}'.\n"
+            f"Valid combinations: {sorted(DATA_DICT.keys())}"
+        )
+
+    path = Path(image_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"Directory not found: {path}")
+
+    files = sorted(f for f in path.iterdir() if f.is_file())
+    if not files:
+        raise RuntimeError(f"No image files found in: {path}")
+
+    rng = random.Random(seed)
+    chosen = rng.choice(files)
+
+    img = load_image(chosen)
+    if img is None:
+        raise RuntimeError(f"Failed to load image: {chosen}")
+
+    native_h = img.shape[0]
+    if resolution >= native_h:
+        raise ValueError(
+            f"Requested resolution {resolution}px >= native resolution "
+            f"{native_h}px. Choose a smaller value."
+        )
+
+    orig_gray  = to_grayscale(img)
+    data_range = float(orig_gray.max() - orig_gray.min()) or 1.0
+
+    # ── Build panels ──────────────────────────────────────────────────────────
+    # Each entry: (title, display_image, mse, psnr, ssim)
+    panels = []
+
+    orig_size_str = f"{native_h} × {native_h}"
+    panels.append((f"Original\n({orig_size_str})", orig_gray, None, None, None))
+
+    for method_name in methods:
+        fn = ALL_METHODS.get(method_name)
+        if fn is None:
+            raise ValueError(f"Unknown method '{method_name}'.")
+
+        ds    = fn(img, resolution)
+        up    = upsample_to_original(ds, native_h)
+
+        ds_gray = to_grayscale(ds)
+        up_gray = to_grayscale(up)
+
+        # Metrics always use the round-trip reconstruction
+        mse  = compute_mse(orig_gray, up_gray)
+        psnr = compute_psnr_from_mse(mse, data_range)
+        ssim = compute_ssim(orig_gray, up_gray)
+
+        if show_reconstruction:
+            display_img  = up_gray
+            size_str     = f"{resolution} × {resolution} → {native_h} × {native_h}"
+        else:
+            display_img  = ds_gray
+            size_str     = f"{resolution} × {resolution}"
+
+        panels.append((
+            f"{method_name}\n({size_str})",
+            display_img,
+            mse, psnr, ssim,
+        ))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    n_panels = len(panels)
+    fig_w    = max(5 * n_panels, 12)
+    fig, axes = plt.subplots(1, n_panels, figsize=(fig_w, 5.8))
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, (label, display_img, mse, psnr, ssim) in zip(axes, panels):
+        ax.imshow(display_img, cmap="gray", vmin=0.0, vmax=1.0,
+                  interpolation="nearest")
+        ax.set_title(label, fontsize=9, fontweight="bold", pad=4)
+        ax.axis("off")
+
+        if mse is not None:
+            psnr_str = f"{psnr:.2f} dB" if not math.isnan(psnr) else "∞"
+            metric_text = (
+                f"MSE  = {mse:.5f}\n"
+                f"PSNR = {psnr_str}\n"
+                f"SSIM = {ssim:.4f}"
+            )
+            ax.text(
+                0.5, -0.04,
+                metric_text,
+                transform=ax.transAxes,
+                ha="center", va="top",
+                fontsize=8,
+                fontfamily="monospace",
+                color="#222222",
+                bbox=dict(
+                    boxstyle="round,pad=0.3",
+                    facecolor="#f5f5f5",
+                    edgecolor="#cccccc",
+                    linewidth=0.8,
+                ),
+            )
+
+    mode_label = "Reconstruction (NN upsampled)" if show_reconstruction else "Downsampled (native resolution)"
+    fig.suptitle(
+        f"Visual Downsampling Comparison  |  "
+        f"Dataset: {dataset}  |  Datatype: {datatype}  |  "
+        f"Target: {resolution}px  |  File: {chosen.name}\n"
+        f"Showing: {mode_label}  |  "
+        f"Metrics computed via round-trip reconstruction.",
+        fontsize=9,
+        fontweight="bold",
+        y=1.02,
+    )
+
+    fig.subplots_adjust(
+        top=0.88,
+        bottom=0.18,
+        left=0.02,
+        right=0.98,
+        wspace=0.06,
+    )
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        methods_tag  = "_".join(methods)
+        mode_tag     = "recon" if show_reconstruction else "ds"
+        out = (
+            save_dir
+            / f"visual_{dataset}_{datatype}_{resolution}px"
+              f"_{methods_tag}_{mode_tag}_{chosen.stem}.png"
+        )
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {out}")
+
+    plt.show()
+    plt.close(fig)
 # ------------------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------------------
@@ -1225,6 +1400,57 @@ def parse_args():
     p.add_argument("--force", action="store_true", help="Delete existing CSVs and start fresh.")
     p.add_argument("--save-plots", action="store_true", help="Save plot PNGs to the output directory.")
     p.add_argument("--csv", type=str, default=None, help="Override path to results_average.csv.")
+    # ── Visual comparison ─────────────────────────────────────────────────────
+    p.add_argument(
+        "--plot-visual",
+        action="store_true",
+        help=(
+            "Show a side-by-side visual comparison of the original image vs "
+            "each downsampled+upsampled version. Requires --visual-dataset and "
+            "--visual-datatype."
+        ),
+    )
+    p.add_argument(
+        "--visual-dataset",
+        type=str,
+        default=None,
+        metavar="DS",
+        help="Dataset for --plot-visual. Accepts: metalset, viaset, stdmetal, stdcontact.",
+    )
+    p.add_argument(
+        "--visual-datatype",
+        type=str,
+        default=None,
+        metavar="DT",
+        help=(
+            "Datatype for --plot-visual. "
+            "Accepts: Target, PixelILT, Printed, Litho, Resist, LevelILT."
+        ),
+    )
+    p.add_argument(
+        "--visual-resolution",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Downsampling resolution for --plot-visual (default: 512).",
+    )
+    p.add_argument(
+        "--visual-seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Random seed for reproducible image selection in --plot-visual.",
+    )
+    p.add_argument(
+        "--visual-reconstruction",
+        action="store_true",
+        default=False,
+        help=(
+            "For --plot-visual: show the NN-upsampled reconstruction at native "
+            "resolution instead of the downsampled image at its native size. "
+            "Metrics are identical either way."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1235,8 +1461,8 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    if not any([args.evaluate, args.plot, args.tables, args.aggregate, args.plot_metric]):
-        print("No action specified. Use --evaluate, --plot, --plot-metric, --aggregate, or --tables.")
+    if not any([args.evaluate, args.plot, args.tables, args.aggregate, args.plot_metric, args.plot_visual]):
+        print("No action specified. Use --evaluate, --plot, --plot-metric, --aggregate, --plot-visual,  or --tables.")
         print("Run with --help for full usage.")
         sys.exit(0)
 
@@ -1355,4 +1581,37 @@ if __name__ == "__main__":
                 filter_datasets=filter_datasets,
             )
 
+    # ── Visual comparison ─────────────────────────────────────────────────────
+    if args.plot_visual:
+        if args.visual_dataset is None or args.visual_datatype is None:
+            print(
+                "Error: --plot-visual requires both --visual-dataset and "
+                "--visual-datatype.\n"
+                "Example: --plot-visual --visual-dataset metalset "
+                "--visual-datatype PixelILT --visual-resolution 512"
+            )
+            sys.exit(1)
+
+        vis_dataset  = DATASET_SHORTHAND.get(
+            args.visual_dataset.lower(), args.visual_dataset
+        )
+        vis_datatype = args.visual_datatype
+        vis_methods  = filter_methods if filter_methods is not None else list(ALL_METHODS.keys())
+
+        print(
+            f"\nGenerating visual comparison: "
+            f"dataset={vis_dataset}, datatype={vis_datatype}, "
+            f"resolution={args.visual_resolution}px, methods={vis_methods}, "
+            f"show_reconstruction={args.visual_reconstruction} ..."
+        )
+        save_dir = str(OUTPUT_DIR) if args.save_plots else None
+        plot_visual_comparison(
+            dataset=vis_dataset,
+            datatype=vis_datatype,
+            resolution=args.visual_resolution,
+            methods=vis_methods,
+            show_reconstruction=args.visual_reconstruction,
+            save_dir=save_dir,
+            seed=args.visual_seed,
+        )
     logger.info("Session end")

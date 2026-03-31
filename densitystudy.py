@@ -114,11 +114,11 @@ DATA_DICT = {
     "ViaSet-LevelILT":     str(DATA_ROOT / "ViaSet"     / "levelsetILT"),
     "ViaSet-Litho":        str(DATA_ROOT / "ViaSet"     / "litho"),
     "ViaSet-PixelILT":     str(DATA_ROOT / "ViaSet"     / "pixelILT"),
-    "StdContact-Printed":  str(DATA_ROOT / "StdContact" / "printed"),
-    "StdContact-Resist":   str(DATA_ROOT / "StdContact" / "resist"),
-    "StdContact-Target":   str(DATA_ROOT / "StdContact" / "target"),
-    "StdContact-Litho":    str(DATA_ROOT / "StdContact" / "litho"),
-    "StdContact-PixelILT": str(DATA_ROOT / "StdContact" / "pixelILT"),
+    "StdContact-Printed":  str(DATA_ROOT / "StdContactFull" / "printed"),
+    "StdContact-Resist":   str(DATA_ROOT / "StdContactFull" / "resist"),
+    "StdContact-Target":   str(DATA_ROOT / "StdContactFull" / "target"),
+    "StdContact-Litho":    str(DATA_ROOT / "StdContactFull" / "litho"),
+    "StdContact-PixelILT": str(DATA_ROOT / "StdContactFull" / "pixelILT"),
     "StdMetal-Printed":    str(DATA_ROOT / "StdMetal"   / "printed"),
     "StdMetal-Resist":     str(DATA_ROOT / "StdMetal"   / "resist"),
     "StdMetal-Target":     str(DATA_ROOT / "StdMetal"   / "target"),
@@ -670,15 +670,16 @@ def plot_density_histograms(
             ax.axvline(mean + std, color="#222222", linewidth=1.2,
                        linestyle="--")
 
-            ax.set_title(f"{dataset}\nn={n:,}", fontsize=10, fontweight="bold")
-            ax.set_xlabel("Pixel Density", fontsize=9)
-            ax.set_ylabel("Count", fontsize=9)
-            ax.legend(fontsize=7, framealpha=0.85)
+            ax.set_title(f"{dataset}\nn={n:,}", fontsize=13, fontweight="bold")
+            ax.set_xlabel("Pixel Density", fontsize=12)
+            ax.set_ylabel("Count", fontsize=12)
+            ax.tick_params(axis="both", labelsize=11)
+            ax.legend(fontsize=10, framealpha=0.85)
             ax.grid(True, alpha=0.2, linestyle="--")
 
         fig.suptitle(
-            f"Pixel Density Distribution  |  Datatype: {datatype}",
-            fontsize=12, fontweight="bold", y=0.97,
+            f"Datatype: {datatype}",
+            fontsize=15, fontweight="bold", y=0.97,
         )
 
         if save_dir is not None:
@@ -760,22 +761,17 @@ def plot_mean_std_by_datatype(
             )
 
         ax.set_xticks(x)
-        ax.set_xticklabels([r["dataset"] for r in rows], rotation=25, ha="right")
-        ax.set_ylabel("Mean Pixel Density")
-        ax.set_xlabel("Dataset")
-        ax.set_title(f"Mean ± Std Pixel Density by Dataset | Datatype: {datatype}")
+        ax.set_xticklabels([r["dataset"] for r in rows], rotation=25, ha="right",
+                           fontsize=13)
+        ax.set_ylabel("Mean Pixel Density", fontsize=13)
+        ax.set_xlabel("Dataset", fontsize=13)
+        ax.set_title(f"Mean ± Std Pixel Density by Dataset | Datatype: {datatype}",
+                     fontsize=14, fontweight="bold")
+        ax.tick_params(axis="y", labelsize=12)
         ax.grid(True, axis="y", alpha=0.25, linestyle="--")
         ax.margins(x=0.08)
 
-        for i, row in enumerate(rows):
-            ax.text(
-                x[i],
-                row["mean"] + row["std"] + 0.005,
-                f"n={row['n']}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
+        # n= annotation removed intentionally
 
         plt.tight_layout()
 
@@ -869,15 +865,17 @@ def bar_plot_snr(
                     bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 0.3,
                     f"{val:.1f}",
-                    ha="center", va="bottom", fontsize=7,
+                    ha="center", va="bottom", fontsize=9,
                 )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(datatypes, rotation=40, ha="right")
-    ax.set_xlabel("Datatype")
-    ax.set_ylabel("SNR  (mean / std)")
-    ax.set_title("Signal-to-Noise Ratio by Dataset and Datatype")
-    ax.legend(title="Dataset", framealpha=0.85)
+    ax.set_xticklabels(datatypes, rotation=40, ha="right", fontsize=12)
+    ax.set_xlabel("Datatype", fontsize=13)
+    ax.set_ylabel("SNR  (mean / std)", fontsize=13)
+    ax.set_title("Signal-to-Noise Ratio by Dataset and Datatype",
+                 fontsize=14, fontweight="bold")
+    ax.tick_params(axis="y", labelsize=12)
+    ax.legend(title="Dataset", fontsize=11, title_fontsize=12, framealpha=0.85)
     ax.grid(True, axis="y", alpha=0.25, linestyle="--")
     plt.tight_layout()
 
@@ -1052,16 +1050,17 @@ def plot_expansion_coefficient(
             x[i],
             row["mean_exp"] + row["std_exp"] + 0.05,
             f"μ={row['mean_exp']:.2f}\nσ={row['std_exp']:.2f}\nn={int(row['n']):,}",
-            ha="center", va="bottom", fontsize=8, color=color,
+            ha="center", va="bottom", fontsize=10, color=color,
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(df_plt["dataset"], fontsize=11)
+    ax.set_xticklabels(df_plt["dataset"], fontsize=13)
     ax.set_ylabel("Expansion Coefficient  (PixelILT density / Target density)",
-                  fontsize=10)
-    ax.set_xlabel("Dataset", fontsize=10)
+                  fontsize=13)
+    ax.set_xlabel("Dataset", fontsize=13)
     ax.set_title("Per-Tile ILT Expansion Coefficient  |  Mean ± Std by Dataset",
-                 fontsize=12)
+                 fontsize=14, fontweight="bold")
+    ax.tick_params(axis="y", labelsize=12)
     ax.grid(True, axis="y", alpha=0.25, linestyle="--")
     ax.margins(x=0.15)
     ax.set_ylim(bottom=0)
