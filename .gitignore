@@ -2,7 +2,16 @@
 
 lithobench-main/
 lithobench-main.zip
+LithoData/
+LithoModels/
 
+
+*.log
+*.log.*
+*.csv
+*.png
+*.gds
+*.glp
 ###############
 
 
