@@ -1,0 +1,3 @@
+[submodule "external/FNO-Conv"]
+	path = external/FNO-Conv
+	url = https://github.com/noamfisher0/FNO-Conv.git
