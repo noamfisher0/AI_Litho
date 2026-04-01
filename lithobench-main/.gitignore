@@ -1,0 +1,15 @@
+*.tar.gz
+*/__pycache__/
+lithobench/ilt/__pycache__/
+lithobench/litho/__pycache__/
+thirdparty/adaptive-boxes/adabox/__pycache__/
+work/MetalSet/
+work/ViaSet/
+work/StdMetal/
+work/StdContact/
+work/StdContactTest/
+saved/MetalSet_*/
+saved/ViaSet_*/
+saved/StdMetal_*/
+saved/StdContact_*/
+dev/

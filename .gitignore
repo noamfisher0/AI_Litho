@@ -1,6 +1,18 @@
 ###############
 
-lithobench-main/
+# lithobench-main/
+
+# LithoBench model weights
+lithobench-main/**/*.pth
+
+
+# Large thirdparty files
+lithobench-main/thirdparty/adaptive-boxes/hires_images/
+lithobench-main/thirdparty/adaptive-boxes/adabox/legacy/prepros/data_npy/
+
+lithobench-main/thirdparty/adaptive-boxes/hires_images/
+lithobench-main/thirdparty/adaptive-boxes/adabox/legacy/prepros/data_npy/
+
 lithobench-main.zip
 LithoData/
 LithoModels/

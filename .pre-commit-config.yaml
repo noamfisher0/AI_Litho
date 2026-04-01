@@ -9,3 +9,4 @@ repos:
       - id: check-merge-conflict
       - id: debug-statements
       - id: check-docstring-first
+        exclude: ^lithobench-main/
