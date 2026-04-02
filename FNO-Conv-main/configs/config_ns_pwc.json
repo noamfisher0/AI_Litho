@@ -1,0 +1,29 @@
+{
+    "which_example": "ns_pwc",
+    "arch":{"n_layers": 4,
+            "width": 128,
+            "modes": [
+                16,
+                16
+            ],
+            "hidden_dim": 128,
+            "use_conv": true,
+            "conv_filters": [
+                3,
+                5
+            ],
+            "padding": null,
+            "include_grid": true,
+            "is_time": true},
+    "lr": 0.001,
+    "batch_size": 32,
+    "weight_decay": 1e-06,
+    "scheduler_step": 15,
+    "scheduler_gamma": 0.98,
+    "epochs": 100,
+    "time_steps": 7,
+    "dt": 2,
+    "num_samples": 128,
+    "time_input": 1,
+    "allowed": "all"
+}
