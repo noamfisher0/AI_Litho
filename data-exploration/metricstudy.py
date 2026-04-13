@@ -76,6 +76,11 @@ Flags
   --force                 delete existing CSVs and start fresh
   --save-plots            save plot PNGs to the output directory
   --bins N                number of histogram bins (default: 40)
+  --candidates A B ...    which candidate datatypes to evaluate against Target
+                            choices: Printed, Resist (default: both)
+                            e.g. --candidates Printed
+                                 --candidates Resist
+                                 --candidates Printed Resist
   --datatypes A B ...     restrict plots to these datatypes  e.g. --datatypes Printed Resist
   --datasets  A B ...     restrict plots to these datasets   e.g. --datasets MetalSet ViaSet
   --epe-spacing N         probe-point spacing along target edges in pixels (default: 2)
@@ -94,6 +99,8 @@ Usage examples
   python metricstudy.py --plot --datatypes Printed --datasets MetalSet ViaSet
   python metricstudy.py --tables
   python metricstudy.py --evaluate --aggregate --plot --save-plots
+  python metricstudy.py --evaluate --candidates Printed
+  python metricstudy.py --evaluate --candidates Resist
   python metricstudy.py --evaluate --force --workers 8
 """
 
@@ -120,10 +127,12 @@ import matplotlib.pyplot as plt
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "metric_study_output"
-LOG_FILE     = OUTPUT_DIR / "metric_study.log"
+PROJECT_ROOT = Path(__file__).resolve().parent
+# DATA_ROOT and OUTPUT_DIR are resolved after argument parsing so that
+# --data-root and --output-dir can override them.  These are placeholders.
+DATA_ROOT  = None
+OUTPUT_DIR = None
+LOG_FILE   = None
 
 # Default EPE parameters (matching LithoBench / DiffOPC conventions)
 DEFAULT_EPE_SPACING       = 2      # probe point spacing in pixels
@@ -131,26 +140,26 @@ DEFAULT_EPE_THRESHOLD     = 1.0    # violation threshold in pixels
 DEFAULT_EPE_BIN_THRESHOLD = 0.5    # candidate binarisation threshold for EPE
                                    # 0.5 = sigmoid midpoint = physical I_th
 
-# Flat path dict mirroring densitystudy.py exactly.
-# Keys are "Dataset-Datatype"; only Printed, Resist, and Target are needed.
-DATA_DICT = {
-    # ── MetalSet ──────────────────────────────────────────────────────────────
-    "MetalSet-Printed":   str(DATA_ROOT / "MetalSet"      / "printed"),
-    "MetalSet-Resist":    str(DATA_ROOT / "MetalSet"      / "resist"),
-    "MetalSet-Target":    str(DATA_ROOT / "MetalSet"      / "target"),
-    # ── ViaSet ────────────────────────────────────────────────────────────────
-    "ViaSet-Printed":     str(DATA_ROOT / "ViaSet"        / "printed"),
-    "ViaSet-Resist":      str(DATA_ROOT / "ViaSet"        / "resist"),
-    "ViaSet-Target":      str(DATA_ROOT / "ViaSet"        / "target"),
-    # ── StdMetal ──────────────────────────────────────────────────────────────
-    "StdMetal-Printed":   str(DATA_ROOT / "StdMetal"      / "printed"),
-    "StdMetal-Resist":    str(DATA_ROOT / "StdMetal"      / "resist"),
-    "StdMetal-Target":    str(DATA_ROOT / "StdMetal"      / "target"),
-    # ── StdContact ────────────────────────────────────────────────────────────
-    "StdContact-Printed": str(DATA_ROOT / "StdContactFull" / "printed"),
-    "StdContact-Resist":  str(DATA_ROOT / "StdContactFull" / "resist"),
-    "StdContact-Target":  str(DATA_ROOT / "StdContactFull" / "target"),
-}
+def _build_data_dict(data_root: Path) -> dict:
+    """Build the flat DATA_DICT from a resolved data root path."""
+    return {
+        # ── MetalSet ──────────────────────────────────────────────────────────
+        "MetalSet-Printed":   str(data_root / "MetalSet"       / "printed"),
+        "MetalSet-Resist":    str(data_root / "MetalSet"       / "resist"),
+        "MetalSet-Target":    str(data_root / "MetalSet"       / "target"),
+        # ── ViaSet ────────────────────────────────────────────────────────────
+        "ViaSet-Printed":     str(data_root / "ViaSet"         / "printed"),
+        "ViaSet-Resist":      str(data_root / "ViaSet"         / "resist"),
+        "ViaSet-Target":      str(data_root / "ViaSet"         / "target"),
+        # ── StdMetal ──────────────────────────────────────────────────────────
+        "StdMetal-Printed":   str(data_root / "StdMetal"       / "printed"),
+        "StdMetal-Resist":    str(data_root / "StdMetal"       / "resist"),
+        "StdMetal-Target":    str(data_root / "StdMetal"       / "target"),
+        # ── StdContact ────────────────────────────────────────────────────────
+        "StdContact-Printed": str(data_root / "StdContactFull" / "printed"),
+        "StdContact-Resist":  str(data_root / "StdContactFull" / "resist"),
+        "StdContact-Target":  str(data_root / "StdContactFull" / "target"),
+    }
 
 # ── CSV schemas ───────────────────────────────────────────────────────────────
 
@@ -614,6 +623,7 @@ def run_evaluation(
     epe_spacing:       int   = DEFAULT_EPE_SPACING,
     epe_threshold:     float = DEFAULT_EPE_THRESHOLD,
     epe_bin_threshold: float = DEFAULT_EPE_BIN_THRESHOLD,
+    candidates:        list  = None,   # e.g. ["printed"], ["resist"], or both
 ):
     """
     Build a flat image-pair work queue for all (dataset, datatype) combinations,
@@ -656,7 +666,8 @@ def run_evaluation(
 
         tgt_files = {f.name: f for f in sorted(tgt_dir.iterdir()) if f.is_file()}
 
-        for datatype in ("printed", "resist"):
+        active_candidates = [c.lower() for c in candidates] if candidates else ["printed", "resist"]
+        for datatype in active_candidates:
             cand_dir = dt_map.get(datatype)
             if cand_dir is None or not cand_dir.exists():
                 logger.info(f"No {datatype} dir for {dataset}, skipping.")
@@ -715,8 +726,9 @@ def run_evaluation(
 
     logger.info(
         f"Starting evaluation | pairs={pending} | workers={num_workers} | "
-        f"batch_size={batch_size} | epe_spacing={epe_spacing} | "
-        f"epe_threshold={epe_threshold} | epe_bin_threshold={epe_bin_threshold}"
+        f"batch_size={batch_size} | candidates={active_candidates} | "
+        f"epe_spacing={epe_spacing} | epe_threshold={epe_threshold} | "
+        f"epe_bin_threshold={epe_bin_threshold}"
     )
     print(
         f"Workers: {num_workers}  |  Pairs: {pending}  |  "
@@ -1101,6 +1113,16 @@ def parse_args():
                    help="Save plot PNGs to the output directory.")
     p.add_argument("--bins",          type=int, default=40,
                    help="Number of histogram bins (default: 40).")
+    p.add_argument("--data-root",      type=str, default=None,
+                   help="Path to the lithobench-main directory. "
+                        "Defaults to ../lithobench-main relative to this script.")
+    p.add_argument("--output-dir",     type=str, default=None,
+                   help="Directory for output CSVs and plots. "
+                        "Defaults to metric_study_output/ next to this script.")
+    p.add_argument("--candidates",     nargs="+", default=None, metavar="CANDIDATE",
+                   help="Which candidate datatypes to evaluate against Target. "
+                        "Choices: Printed, Resist (default: both). "
+                        "E.g. --candidates Printed  or  --candidates Printed Resist")
     p.add_argument("--datatypes",     nargs="+", default=None, metavar="DATATYPE",
                    help="Restrict all plots to these datatypes (case-insensitive). "
                         "E.g. --datatypes Printed Resist")
@@ -1118,7 +1140,13 @@ def parse_args():
                         f"EPE computation (default: {DEFAULT_EPE_BIN_THRESHOLD}). "
                         f"Corresponds to sigmoid midpoint / physical I_th. "
                         f"Has no effect on the already-binary Printed datatype.")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.candidates:
+        valid = {"printed", "resist"}
+        bad = [c for c in args.candidates if c.lower() not in valid]
+        if bad:
+            p.error(f"--candidates: invalid choice(s): {bad}. Choose from Printed, Resist.")
+    return args
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1138,6 +1166,12 @@ if __name__ == "__main__":
         print("Run with --help for full usage.")
         sys.exit(0)
 
+    # Resolve paths now that args are available
+    DATA_ROOT  = Path(args.data_root).resolve()  if args.data_root  else PROJECT_ROOT.parent / "lithobench-main"
+    OUTPUT_DIR = Path(args.output_dir).resolve() if args.output_dir else PROJECT_ROOT / "metric_study_output"
+    LOG_FILE   = OUTPUT_DIR / "metric_study.log"
+    DATA_DICT  = _build_data_dict(DATA_ROOT)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     setup_logging(LOG_FILE)
     logger = get_logger()
@@ -1152,9 +1186,9 @@ if __name__ == "__main__":
         f"plot={args.plot} | plot_mean_std={args.plot_mean_std} | "
         f"tables={args.tables} | workers={args.workers} | "
         f"batch_size={args.batch_size} | samples={args.samples} | "
-        f"force={args.force} | datatypes={args.datatypes} | "
-        f"datasets={args.datasets} | epe_spacing={args.epe_spacing} | "
-        f"epe_threshold={args.epe_threshold} | "
+        f"force={args.force} | candidates={args.candidates} | "
+        f"datatypes={args.datatypes} | datasets={args.datasets} | "
+        f"epe_spacing={args.epe_spacing} | epe_threshold={args.epe_threshold} | "
         f"epe_bin_threshold={args.epe_bin_threshold}"
     )
 
@@ -1172,6 +1206,7 @@ if __name__ == "__main__":
             epe_spacing       = args.epe_spacing,
             epe_threshold     = args.epe_threshold,
             epe_bin_threshold = args.epe_bin_threshold,
+            candidates        = args.candidates,
         )
 
     # ── Standalone aggregation ────────────────────────────────────────────────

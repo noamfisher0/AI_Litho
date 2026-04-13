@@ -89,7 +89,7 @@ import matplotlib.pyplot as plt
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
 OUTPUT_DIR   = PROJECT_ROOT / "density_study_output"
 LOG_FILE     = OUTPUT_DIR / "density_study.log"
