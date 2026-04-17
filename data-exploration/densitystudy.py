@@ -91,7 +91,8 @@ import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT    = PROJECT_ROOT / "lithobench-main"
-OUTPUT_DIR   = PROJECT_ROOT / "density_study_output"
+# OUTPUT_DIR   = PROJECT_ROOT / "density_study_output"
+OUTPUT_DIR   = Path("/Users/noamfisher/Desktop/NF-Thesis/data-exploration/density_study_output")
 LOG_FILE     = OUTPUT_DIR / "density_study.log"
 
 # Cap images per subset for test runs — set to None for the full dataset
