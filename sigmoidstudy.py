@@ -11,6 +11,9 @@ We fit this two-parameter sigmoid to paired pixel samples across tiles,
 then visualise the quality of the fit and report the implied threshold
 for printed binarisation (Ith, corresponding to Z=0.5).
 
+Also supports --validate-threshold to verify that aerial > Ith reproduces
+the ground truth printed images (IOU, pixel accuracy, visual examples).
+
 Usage
 -----
 # Full run on MetalSet (aerial + resist)
@@ -19,20 +22,19 @@ python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet
 # Resume a partial run
 python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --resume
 
-# Multiple datasets
-python sigmoidstudy.py --data-root /path/to/lithobench \
-    --datasets MetalSet ViaSet --output-dir ./sigmoidstudy_results
+# Validate threshold against printed ground truth (uses stored results)
+python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --validate-threshold
 
-# Limit pixels per tile for speed (subsampling)
-python sigmoidstudy.py --data-root /path/to/lithobench \
-    --datasets MetalSet --max-pixels-per-tile 1024
+# Validate with a custom threshold override
+python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --validate-threshold --threshold-override 0.225
+
+# Sigmoid curve plot only (no refitting)
+python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --plot-sigmoid
 """
 
 import argparse
 import json
-import os
 import pickle
-import sys
 import time
 import warnings
 from pathlib import Path
@@ -43,7 +45,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
-from scipy.stats import pearsonr
 from tqdm import tqdm
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,14 +54,15 @@ from tqdm import tqdm
 DATASETS = ["MetalSet", "ViaSet", "StdMetal", "StdContact"]
 
 DATA_DICT = {
-    "MetalSet":   {"aerial": "litho",   "resist": "resist"},
-    "ViaSet":     {"aerial": "litho",   "resist": "resist"},
-    "StdMetal":   {"aerial": "litho",   "resist": "resist"},
-    "StdContact": {"aerial": "litho",   "resist": "resist"},
+    "MetalSet":   {"aerial": "litho", "resist": "resist", "printed": "printed"},
+    "ViaSet":     {"aerial": "litho", "resist": "resist", "printed": "printed"},
+    "StdMetal":   {"aerial": "litho", "resist": "resist", "printed": "printed"},
+    "StdContact": {"aerial": "litho", "resist": "resist", "printed": "printed"},
 }
 
 COMPLETED_CSV = "completed_tiles.csv"
 RESULTS_JSON  = "sigmoid_results.json"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sigmoid model
@@ -81,13 +83,11 @@ def load_tile(path: Path):
         suffix = path.suffix.lower()
         if suffix == ".png":
             from PIL import Image
-            img = Image.open(path).convert("L")   # greyscale
-            arr = np.array(img, dtype=np.float32) / 255.0
-            return arr
+            img = Image.open(path).convert("L")
+            return np.array(img, dtype=np.float32) / 255.0
         elif suffix == ".npy":
-            arr = np.load(path).astype(np.float32)
-            return arr
-        else:  # pickle
+            return np.load(path).astype(np.float32)
+        else:
             with open(path, "rb") as f:
                 data = pickle.load(f)
             if isinstance(data, np.ndarray):
@@ -101,45 +101,34 @@ def load_tile(path: Path):
         return None
 
 
-def find_tile_pairs(data_root: Path, dataset: str):
+def find_tile_pairs(data_root: Path, dataset: str, keys: list):
     """
-    Find matched (aerial, resist) tile file pairs for a dataset.
-    Returns list of (aerial_path, resist_path, tile_id) tuples.
+    Find matched tile file tuples for given keys (e.g. ['aerial','resist','printed']).
+    Returns list of (tile_id, {key: path}) tuples.
+    Only tiles present in ALL keys are returned.
     """
-    aerial_key  = DATA_DICT[dataset]["aerial"]
-    resist_key  = DATA_DICT[dataset]["resist"]
+    dirs = {}
+    for key in keys:
+        subdir_name = DATA_DICT[dataset][key]
+        d = data_root / dataset / subdir_name
+        if not d.exists():
+            print(f"  [WARN] Dir not found: {d}")
+            return []
+        dirs[key] = d
 
-    aerial_dir = data_root / dataset / aerial_key
-    resist_dir = data_root / dataset / resist_key
+    files_per_key = {}
+    for key, d in dirs.items():
+        for ext in ("*.pkl", "*.npy", "*.png"):
+            found = {p.stem: p for p in sorted(d.glob(ext))}
+            if found:
+                files_per_key[key] = found
+                break
+        if key not in files_per_key:
+            print(f"  [WARN] No files found in {dirs[key]}")
+            return []
 
-    if not aerial_dir.exists():
-        print(f"  [WARN] Aerial dir not found: {aerial_dir}")
-        return []
-    if not resist_dir.exists():
-        print(f"  [WARN] Resist dir not found: {resist_dir}")
-        return []
-
-    aerial_files = {p.stem: p for p in sorted(aerial_dir.glob("*.pkl"))}
-    resist_files = {p.stem: p for p in sorted(resist_dir.glob("*.pkl"))}
-
-    common = sorted(set(aerial_files.keys()) & set(resist_files.keys()))
-    pairs  = [(aerial_files[k], resist_files[k], k) for k in common]
-
-    if not pairs:
-        # Try .npy files
-        aerial_files = {p.stem: p for p in sorted(aerial_dir.glob("*.npy"))}
-        resist_files = {p.stem: p for p in sorted(resist_dir.glob("*.npy"))}
-        common = sorted(set(aerial_files.keys()) & set(resist_files.keys()))
-        pairs  = [(aerial_files[k], resist_files[k], k) for k in common]
-
-    if not pairs:
-        # Try .png files
-        aerial_files = {p.stem: p for p in sorted(aerial_dir.glob("*.png"))}
-        resist_files = {p.stem: p for p in sorted(resist_dir.glob("*.png"))}
-        common = sorted(set(aerial_files.keys()) & set(resist_files.keys()))
-        pairs  = [(aerial_files[k], resist_files[k], k) for k in common]
-
-    return pairs
+    common = sorted(set.intersection(*[set(f.keys()) for f in files_per_key.values()]))
+    return [(tid, {key: files_per_key[key][tid] for key in keys}) for tid in common]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -147,7 +136,6 @@ def find_tile_pairs(data_root: Path, dataset: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_completed(output_dir: Path, dataset: str):
-    """Return set of already-processed tile IDs for this dataset."""
     csv_path = output_dir / dataset / COMPLETED_CSV
     if not csv_path.exists():
         return set()
@@ -156,7 +144,6 @@ def load_completed(output_dir: Path, dataset: str):
 
 
 def save_completed(output_dir: Path, dataset: str, records: list):
-    """Append tile records to the completed CSV."""
     csv_path = output_dir / dataset / COMPLETED_CSV
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(records)
@@ -172,101 +159,80 @@ def save_completed(output_dir: Path, dataset: str, records: list):
 
 def fit_tile(aerial: np.ndarray, resist: np.ndarray,
              max_pixels: int = None, rng=None):
-    """
-    Fit sigmoid parameters to one (aerial, resist) tile pair.
-    Returns dict with alpha, Ith, r2, rmse, n_pixels, or None on failure.
-    """
     I = aerial.ravel().astype(np.float64)
     Z = resist.ravel().astype(np.float64)
-
-    # Remove border pixels that are exactly 0 in both (uninformative background)
     mask = ~((I < 1e-6) & (Z < 1e-6))
     I, Z = I[mask], Z[mask]
-
     if len(I) < 50:
         return None
-
-    # Optional subsampling
     if max_pixels is not None and len(I) > max_pixels:
         if rng is None:
             rng = np.random.default_rng(42)
         idx = rng.choice(len(I), size=max_pixels, replace=False)
         I, Z = I[idx], Z[idx]
-
-    # Initial guess: alpha=100, Ith=median of aerial
-    p0 = [100.0, float(np.median(I))]
+    p0     = [100.0, float(np.median(I))]
     bounds = ([1.0, 0.0], [1e5, 1.0])
-
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            popt, _ = curve_fit(sigmoid, I, Z, p0=p0, bounds=bounds,
-                                maxfev=5000)
+            popt, _ = curve_fit(sigmoid, I, Z, p0=p0, bounds=bounds, maxfev=5000)
         alpha, Ith = popt
-
         Z_pred = sigmoid(I, alpha, Ith)
         ss_res = np.sum((Z - Z_pred) ** 2)
         ss_tot = np.sum((Z - Z.mean()) ** 2)
         r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        rmse   = np.sqrt(np.mean((Z - Z_pred) ** 2))
-
-        return {
-            "alpha":    float(alpha),
-            "Ith":      float(Ith),
-            "r2":       float(r2),
-            "rmse":     float(rmse),
-            "n_pixels": int(len(I)),
-        }
+        rmse   = float(np.sqrt(np.mean((Z - Z_pred) ** 2)))
+        return {"alpha": float(alpha), "Ith": float(Ith),
+                "r2": float(r2), "rmse": rmse, "n_pixels": int(len(I))}
     except Exception:
         return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Visualisations
+# Threshold validation metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
-def plot_parameter_distributions(df: pd.DataFrame, dataset: str,
-                                 output_dir: Path):
-    """Histogram of alpha and Ith across all tiles."""
+def compute_threshold_metrics(aerial: np.ndarray, printed_gt: np.ndarray, Ith: float):
+    pred = (aerial > Ith).astype(np.uint8)
+    gt   = (printed_gt > 0.5).astype(np.uint8)
+    tp = int(np.sum((pred == 1) & (gt == 1)))
+    fp = int(np.sum((pred == 1) & (gt == 0)))
+    fn = int(np.sum((pred == 0) & (gt == 1)))
+    tn = int(np.sum((pred == 0) & (gt == 0)))
+    iou       = tp / (tp + fp + fn + 1e-8)
+    pa        = (tp + tn) / (tp + fp + fn + tn + 1e-8)
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1        = 2 * precision * recall / (precision + recall + 1e-8)
+    fpr       = fp / (fp + tn + 1e-8)
+    fnr       = fn / (fn + tp + 1e-8)
+    return {"iou": iou, "pa": pa, "f1": f1,
+            "precision": precision, "recall": recall,
+            "fpr": fpr, "fnr": fnr,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualisations — fitting
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_parameter_distributions(df: pd.DataFrame, dataset: str, output_dir: Path):
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(f"{dataset} — Sigmoid Parameter Distributions", fontsize=14)
-
-    # Alpha
-    ax = axes[0]
-    ax.hist(df["alpha"], bins=50, color="#2196F3", edgecolor="white",
-            linewidth=0.5)
-    ax.axvline(df["alpha"].median(), color="red", linestyle="--",
-               label=f"Median={df['alpha'].median():.1f}")
-    ax.set_xlabel("α (steepness)", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title("α Distribution")
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-
-    # Ith
-    ax = axes[1]
-    ax.hist(df["Ith"], bins=50, color="#4CAF50", edgecolor="white",
-            linewidth=0.5)
-    ax.axvline(df["Ith"].median(), color="red", linestyle="--",
-               label=f"Median={df['Ith'].median():.4f}")
-    ax.set_xlabel("I_th (intensity threshold)", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title("I_th Distribution")
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-
-    # R²
-    ax = axes[2]
-    ax.hist(df["r2"], bins=50, color="#FF9800", edgecolor="white",
-            linewidth=0.5)
-    ax.axvline(df["r2"].median(), color="red", linestyle="--",
-               label=f"Median R²={df['r2'].median():.4f}")
-    ax.set_xlabel("R² (goodness of fit)", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title("Per-tile R² Distribution")
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-
+    specs = [
+        ("alpha", "#2196F3", "alpha (steepness)", ".1f"),
+        ("Ith",   "#4CAF50", "I_th (intensity threshold)", ".4f"),
+        ("r2",    "#FF9800", "R^2 (goodness of fit)", ".4f"),
+    ]
+    for ax, (col, color, label, fmt) in zip(axes, specs):
+        ax.hist(df[col], bins=50, color=color, edgecolor="white", linewidth=0.5)
+        med = df[col].median()
+        ax.axvline(med, color="red", linestyle="--", label=f"Median={med:{fmt}}")
+        ax.set_xlabel(label, fontsize=12)
+        ax.set_ylabel("Count", fontsize=12)
+        ax.set_title(f"{col} Distribution")
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
     plt.tight_layout()
     out = output_dir / dataset / "parameter_distributions.png"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -275,51 +241,34 @@ def plot_parameter_distributions(df: pd.DataFrame, dataset: str,
     print(f"  Saved: {out}")
 
 
-def plot_global_fit(all_aerial: np.ndarray, all_resist: np.ndarray,
-                    alpha: float, Ith: float, dataset: str,
-                    output_dir: Path):
-    """Scatter plot of aerial vs resist pixels with fitted sigmoid overlay."""
+def plot_global_fit(all_I: np.ndarray, all_Z: np.ndarray,
+                    alpha: float, Ith: float, dataset: str, output_dir: Path):
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(f"{dataset} — Global Sigmoid Fit  "
-                 f"(α={alpha:.1f}, I_th={Ith:.4f})", fontsize=14)
-
-    # Subsample for display (max 50k points)
+    fig.suptitle(f"{dataset} — Global Sigmoid Fit  (alpha={alpha:.1f}, I_th={Ith:.4f})",
+                 fontsize=14)
     rng = np.random.default_rng(0)
-    n   = min(50_000, len(all_aerial))
-    idx = rng.choice(len(all_aerial), size=n, replace=False)
-    I_s = all_aerial[idx]
-    Z_s = all_resist[idx]
-
-    # Scatter
+    idx = rng.choice(len(all_I), size=min(50_000, len(all_I)), replace=False)
     ax = axes[0]
-    ax.scatter(I_s, Z_s, s=0.5, alpha=0.3, color="#2196F3", rasterized=True)
-    I_range = np.linspace(all_aerial.min(), all_aerial.max(), 500)
-    Z_fit   = sigmoid(I_range, alpha, Ith)
-    ax.plot(I_range, Z_fit, color="red", linewidth=2,
-            label=f"Fit: α={alpha:.1f}, I_th={Ith:.4f}")
-    ax.axvline(Ith, color="orange", linestyle=":", linewidth=1.5,
-               label=f"I_th (Z=0.5 boundary)")
+    ax.scatter(all_I[idx], all_Z[idx], s=0.5, alpha=0.3, color="#2196F3", rasterized=True)
+    I_range = np.linspace(all_I.min(), all_I.max(), 500)
+    ax.plot(I_range, sigmoid(I_range, alpha, Ith), color="red", linewidth=2,
+            label=f"Fit: alpha={alpha:.1f}, I_th={Ith:.4f}")
+    ax.axvline(Ith, color="orange", linestyle=":", linewidth=1.5, label="I_th (Z=0.5 boundary)")
     ax.axhline(0.5, color="orange", linestyle=":", linewidth=1.5)
     ax.set_xlabel("Aerial intensity I", fontsize=12)
     ax.set_ylabel("Resist value Z", fontsize=12)
     ax.set_title("Aerial vs Resist (sampled pixels)")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-
-    # Residual histogram
     ax = axes[1]
-    Z_pred = sigmoid(all_aerial, alpha, Ith)
-    residuals = all_resist - Z_pred
-    ax.hist(residuals, bins=100, color="#9C27B0", edgecolor="white",
-            linewidth=0.3)
+    residuals = all_Z - sigmoid(all_I, alpha, Ith)
+    ax.hist(residuals, bins=100, color="#9C27B0", edgecolor="white", linewidth=0.3)
     ax.axvline(0, color="red", linestyle="--", linewidth=1.5)
     ax.set_xlabel("Residual (Z_gt - Z_fit)", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
     ax.set_title(f"Residual Distribution\n"
-                 f"RMSE={np.sqrt(np.mean(residuals**2)):.5f}, "
-                 f"Bias={residuals.mean():.5f}")
+                 f"RMSE={np.sqrt(np.mean(residuals**2)):.5f}, Bias={residuals.mean():.5f}")
     ax.grid(True, alpha=0.3)
-
     plt.tight_layout()
     out = output_dir / dataset / "global_fit.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
@@ -328,14 +277,13 @@ def plot_global_fit(all_aerial: np.ndarray, all_resist: np.ndarray,
 
 
 def plot_alpha_vs_Ith(df: pd.DataFrame, dataset: str, output_dir: Path):
-    """Scatter of alpha vs Ith coloured by R² to check parameter coupling."""
     fig, ax = plt.subplots(figsize=(8, 6))
     sc = ax.scatter(df["Ith"], df["alpha"], c=df["r2"], cmap="viridis",
                     s=5, alpha=0.6, rasterized=True)
-    plt.colorbar(sc, ax=ax, label="R²")
+    plt.colorbar(sc, ax=ax, label="R^2")
     ax.set_xlabel("I_th", fontsize=12)
-    ax.set_ylabel("α", fontsize=12)
-    ax.set_title(f"{dataset} — α vs I_th (coloured by R²)", fontsize=13)
+    ax.set_ylabel("alpha", fontsize=12)
+    ax.set_title(f"{dataset} — alpha vs I_th (coloured by R^2)", fontsize=13)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     out = output_dir / dataset / "alpha_vs_Ith.png"
@@ -345,51 +293,33 @@ def plot_alpha_vs_Ith(df: pd.DataFrame, dataset: str, output_dir: Path):
 
 
 def plot_example_tiles(example_records: list, dataset: str, output_dir: Path):
-    """
-    Show a grid of example tiles: aerial | resist GT | sigmoid fit | residual.
-    example_records: list of dicts with keys aerial, resist, alpha, Ith, r2
-    """
     n = len(example_records)
     if n == 0:
         return
-
     fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
-
     fig.suptitle(f"{dataset} — Example Tile Fits", fontsize=14)
-    col_titles = ["Aerial (I)", "Resist GT (Z)", "Sigmoid Fit", "Residual"]
-    for j, title in enumerate(col_titles):
+    for j, title in enumerate(["Aerial (I)", "Resist GT (Z)", "Sigmoid Fit", "Residual"]):
         axes[0, j].set_title(title, fontsize=12, fontweight="bold")
-
     for i, rec in enumerate(example_records):
-        aerial  = rec["aerial"]
-        resist  = rec["resist"]
-        Z_fit   = sigmoid(aerial, rec["alpha"], rec["Ith"]).astype(np.float32)
+        aerial   = rec["aerial"]
+        resist   = rec["resist"]
+        Z_fit    = sigmoid(aerial, rec["alpha"], rec["Ith"]).astype(np.float32)
         residual = resist - Z_fit
-
-        vmin_a, vmax_a = aerial.min(), aerial.max()
-
-        im0 = axes[i, 0].imshow(aerial,   cmap="gray",
-                                 vmin=vmin_a, vmax=vmax_a)
-        im1 = axes[i, 1].imshow(resist,   cmap="gray", vmin=0, vmax=1)
-        im2 = axes[i, 2].imshow(Z_fit,    cmap="gray", vmin=0, vmax=1)
-        im3 = axes[i, 3].imshow(residual, cmap="RdBu",
-                                 vmin=-0.2, vmax=0.2)
-
-        plt.colorbar(im0, ax=axes[i, 0], fraction=0.046, pad=0.04)
-        plt.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
-        plt.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
-        plt.colorbar(im3, ax=axes[i, 3], fraction=0.046, pad=0.04)
-
-        label = (f"α={rec['alpha']:.0f}  I_th={rec['Ith']:.4f}  "
-                 f"R²={rec['r2']:.4f}")
-        axes[i, 0].set_ylabel(label, fontsize=9)
-
-        for j in range(4):
+        ims = [
+            axes[i, 0].imshow(aerial,   cmap="gray", vmin=aerial.min(), vmax=aerial.max()),
+            axes[i, 1].imshow(resist,   cmap="gray", vmin=0, vmax=1),
+            axes[i, 2].imshow(Z_fit,    cmap="gray", vmin=0, vmax=1),
+            axes[i, 3].imshow(residual, cmap="RdBu", vmin=-0.2, vmax=0.2),
+        ]
+        for j, im in enumerate(ims):
+            plt.colorbar(im, ax=axes[i, j], fraction=0.046, pad=0.04)
             axes[i, j].set_xticks([])
             axes[i, j].set_yticks([])
-
+        axes[i, 0].set_ylabel(
+            f"alpha={rec['alpha']:.0f}  I_th={rec['Ith']:.4f}  R2={rec['r2']:.4f}",
+            fontsize=9)
     plt.tight_layout()
     out = output_dir / dataset / "example_tiles.png"
     plt.savefig(out, dpi=120, bbox_inches="tight")
@@ -397,39 +327,158 @@ def plot_example_tiles(example_records: list, dataset: str, output_dir: Path):
     print(f"  Saved: {out}")
 
 
+def plot_sigmoid_curve(alpha: float, Ith: float, dataset: str,
+                       output_dir: Path, I_range: tuple = (0.0, 1.0),
+                       show_annotations: bool = True,
+                       figsize: tuple = (8, 5), dpi: int = 150):
+    """Publication-quality sigmoid curve with threshold annotation."""
+    I = np.linspace(I_range[0], I_range[1], 2000)
+    Z = sigmoid(I, alpha, Ith)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(I, Z, color="#2196F3", linewidth=2.5, label="Z = sigmoid(alpha*(I - I_th))")
+    ax.axvline(Ith, color="red", linestyle="--", linewidth=1.5,
+               label=f"I_th = {Ith:.4f}")
+    ax.axhline(0.5, color="orange", linestyle="--", linewidth=1.5,
+               label="Z = 0.5 (print boundary)")
+    ax.scatter([Ith], [0.5], color="red", s=80, zorder=5)
+    if show_annotations:
+        offset = (I_range[1] - I_range[0]) * 0.08
+        ax.annotate(
+            f"  (I_th, 0.5) = ({Ith:.4f}, 0.5)",
+            xy=(Ith, 0.5), xytext=(Ith + offset, 0.35),
+            fontsize=10, color="red",
+            arrowprops=dict(arrowstyle="->", color="red", lw=1.2),
+        )
+        mid_left  = I_range[0] + (Ith - I_range[0]) * 0.4
+        mid_right = Ith + (I_range[1] - Ith) * 0.5
+        ax.text(mid_left,  0.08, "Not printed", fontsize=10, color="gray", ha="center")
+        ax.text(mid_right, 0.92, "Printed",     fontsize=10, color="gray", ha="center")
+        ax.fill_betweenx([0, 1], I_range[0], Ith,        alpha=0.05, color="blue")
+        ax.fill_betweenx([0, 1], Ith, I_range[1],         alpha=0.05, color="green")
+    ax.set_xlabel("Aerial Intensity I", fontsize=13)
+    ax.set_ylabel("Resist Value Z", fontsize=13)
+    ax.set_title(f"{dataset} Resist Model: alpha={alpha:.1f}, I_th={Ith:.4f}", fontsize=13)
+    ax.legend(fontsize=11, loc="upper left")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(I_range[0], I_range[1])
+    ax.set_ylim(-0.05, 1.05)
+    ax.tick_params(labelsize=11)
+    plt.tight_layout()
+    out = output_dir / dataset / "sigmoid_curve.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualisations — threshold validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_threshold_validation(metrics_df: pd.DataFrame, example_records: list,
+                               dataset: str, Ith: float, output_dir: Path):
+    # Metric distributions
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f"{dataset} — Threshold Validation  (I_th={Ith:.4f})", fontsize=14)
+    for ax, (col, color, label) in zip(axes, [
+        ("iou", "#2196F3", "IOU"),
+        ("f1",  "#4CAF50", "F1 Score"),
+        ("pa",  "#FF9800", "Pixel Accuracy"),
+    ]):
+        ax.hist(metrics_df[col], bins=50, color=color, edgecolor="white", linewidth=0.5)
+        med = metrics_df[col].median()
+        ax.axvline(med, color="red", linestyle="--", label=f"Median={med:.4f}")
+        ax.set_xlabel(label, fontsize=12)
+        ax.set_ylabel("Count", fontsize=12)
+        ax.set_title(f"{label} Distribution")
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / dataset / "threshold_validation_metrics.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out}")
+
+    # Summary bar chart
+    fig, ax = plt.subplots(figsize=(7, 5))
+    metric_names = ["IOU", "F1", "Pixel Acc", "Precision", "Recall"]
+    metric_cols  = ["iou", "f1", "pa", "precision", "recall"]
+    means  = [metrics_df[c].mean() for c in metric_cols]
+    stds   = [metrics_df[c].std()  for c in metric_cols]
+    colors = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#F44336"]
+    bars = ax.bar(metric_names, means, yerr=stds, capsize=5,
+                  color=colors, alpha=0.85, edgecolor="black")
+    for bar, mean in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f"{mean:.4f}", ha="center", va="bottom", fontsize=10)
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel("Score", fontsize=12)
+    ax.set_title(f"{dataset} — Mean Threshold Metrics\n"
+                 f"(aerial > {Ith:.4f} => predicted printed)", fontsize=12)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    out = output_dir / dataset / "threshold_validation_summary.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out}")
+
+    # Example tile grid: aerial | pred | GT | error
+    n = len(example_records)
+    if n == 0:
+        return
+    fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+    fig.suptitle(f"{dataset} — Threshold Validation Examples  (I_th={Ith:.4f})", fontsize=14)
+    for j, title in enumerate(["Aerial (I)", "Threshold Pred (I > I_th)",
+                                "Printed GT", "Error (FP=red, FN=blue)"]):
+        axes[0, j].set_title(title, fontsize=11, fontweight="bold")
+    for i, rec in enumerate(example_records):
+        aerial  = rec["aerial"]
+        gt      = rec["printed_gt"]
+        pred    = (aerial > Ith).astype(np.float32)
+        gt_bin  = (gt > 0.5).astype(np.float32)
+        error   = pred - gt_bin   # +1=FP, -1=FN
+        ims = [
+            axes[i, 0].imshow(aerial, cmap="gray", vmin=aerial.min(), vmax=aerial.max()),
+            axes[i, 1].imshow(pred,   cmap="gray", vmin=0, vmax=1),
+            axes[i, 2].imshow(gt,     cmap="gray", vmin=0, vmax=1),
+            axes[i, 3].imshow(error,  cmap="RdBu", vmin=-1, vmax=1),
+        ]
+        for j, im in enumerate(ims):
+            plt.colorbar(im, ax=axes[i, j], fraction=0.046, pad=0.04)
+            axes[i, j].set_xticks([])
+            axes[i, j].set_yticks([])
+        axes[i, 0].set_ylabel(f"IOU={rec['iou']:.4f}  F1={rec['f1']:.4f}", fontsize=9)
+    plt.tight_layout()
+    out = output_dir / dataset / "threshold_validation_examples.png"
+    plt.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out}")
+
+
 def plot_cross_dataset_summary(all_results: dict, output_dir: Path):
-    """Bar chart comparing alpha and Ith across datasets."""
     datasets = list(all_results.keys())
     if len(datasets) < 2:
         return
-
-    alphas = [all_results[d]["global_alpha"]  for d in datasets]
-    Iths   = [all_results[d]["global_Ith"]    for d in datasets]
-    alpha_stds = [all_results[d]["std_alpha"] for d in datasets]
-    Ith_stds   = [all_results[d]["std_Ith"]   for d in datasets]
-
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Cross-Dataset Sigmoid Parameter Comparison", fontsize=14)
-
+    colors = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"]
     x = np.arange(len(datasets))
-    axes[0].bar(x, alphas, yerr=alpha_stds, capsize=5,
-                color=["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"][:len(datasets)],
-                alpha=0.8, edgecolor="black")
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(datasets, fontsize=11)
-    axes[0].set_ylabel("α (steepness)", fontsize=12)
-    axes[0].set_title("α per Dataset")
-    axes[0].grid(True, alpha=0.3, axis="y")
-
-    axes[1].bar(x, Iths, yerr=Ith_stds, capsize=5,
-                color=["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"][:len(datasets)],
-                alpha=0.8, edgecolor="black")
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(datasets, fontsize=11)
-    axes[1].set_ylabel("I_th (intensity threshold)", fontsize=12)
-    axes[1].set_title("I_th per Dataset")
-    axes[1].grid(True, alpha=0.3, axis="y")
-
+    for ax, (key, std_key, ylabel, title) in zip(axes, [
+        ("global_alpha", "std_alpha", "alpha (steepness)", "alpha per Dataset"),
+        ("global_Ith",   "std_Ith",   "I_th (intensity threshold)", "I_th per Dataset"),
+    ]):
+        vals = [all_results[d][key]     for d in datasets]
+        stds = [all_results[d][std_key] for d in datasets]
+        ax.bar(x, vals, yerr=stds, capsize=5, color=colors[:len(datasets)],
+               alpha=0.8, edgecolor="black")
+        ax.set_xticks(x)
+        ax.set_xticklabels(datasets, fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     out = output_dir / "cross_dataset_summary.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
@@ -438,7 +487,70 @@ def plot_cross_dataset_summary(all_results: dict, output_dir: Path):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main per-dataset pipeline
+# Threshold validation pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_threshold_validation(dataset: str, data_root: Path, output_dir: Path,
+                              Ith: float, n_examples: int, max_tiles: int = None):
+    print(f"\n  Threshold Validation — {dataset}  (I_th={Ith:.4f})")
+    pairs = find_tile_pairs(data_root, dataset, keys=["aerial", "printed"])
+    if not pairs:
+        print("  [SKIP] No aerial+printed pairs found.")
+        return
+    if max_tiles:
+        pairs = pairs[:max_tiles]
+    print(f"  Validating on {len(pairs)} tiles...")
+
+    records      = []
+    example_data = []
+
+    for tile_id, paths in tqdm(pairs, desc=f"Validating {dataset}",
+                                unit="tile", dynamic_ncols=True):
+        aerial  = load_tile(paths["aerial"])
+        printed = load_tile(paths["printed"])
+        if aerial is None or printed is None:
+            continue
+        if aerial.shape != printed.shape:
+            continue
+        m = compute_threshold_metrics(aerial, printed, Ith)
+        m["tile_id"] = tile_id
+        records.append(m)
+        if len(example_data) < n_examples:
+            example_data.append({
+                "aerial":     aerial,
+                "printed_gt": printed,
+                "iou":        m["iou"],
+                "f1":         m["f1"],
+            })
+
+    if not records:
+        print("  [WARN] No valid tiles processed.")
+        return
+
+    df = pd.DataFrame(records)
+
+    print(f"\n  Threshold Validation Results (I_th={Ith:.4f}):")
+    print(f"    IOU            — mean: {df['iou'].mean():.4f}  "
+          f"median: {df['iou'].median():.4f}  std: {df['iou'].std():.4f}")
+    print(f"    F1             — mean: {df['f1'].mean():.4f}  "
+          f"median: {df['f1'].median():.4f}  std: {df['f1'].std():.4f}")
+    print(f"    Pixel Accuracy — mean: {df['pa'].mean():.4f}  "
+          f"median: {df['pa'].median():.4f}  std: {df['pa'].std():.4f}")
+    print(f"    Precision      — mean: {df['precision'].mean():.4f}")
+    print(f"    Recall         — mean: {df['recall'].mean():.4f}")
+    print(f"    FPR            — mean: {df['fpr'].mean():.4f}")
+    print(f"    FNR            — mean: {df['fnr'].mean():.4f}")
+
+    csv_out = output_dir / dataset / "threshold_validation_results.csv"
+    csv_out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_out, index=False)
+    print(f"  Saved: {csv_out}")
+
+    plot_threshold_validation(df, example_data, dataset, Ith, output_dir)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main per-dataset fitting pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_dataset(dataset: str, data_root: Path, output_dir: Path,
@@ -448,37 +560,30 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
     print(f"  Dataset: {dataset}")
     print(f"{'='*60}")
 
-    pairs = find_tile_pairs(data_root, dataset)
+    pairs = find_tile_pairs(data_root, dataset, keys=["aerial", "resist"])
     if not pairs:
         print(f"  [SKIP] No tile pairs found for {dataset}")
         return None
 
     print(f"  Found {len(pairs)} tile pairs")
-
     completed = load_completed(output_dir, dataset) if resume else set()
     if completed:
         print(f"  Resuming: {len(completed)} tiles already processed")
 
-    rng = np.random.default_rng(42)
+    rng           = np.random.default_rng(42)
     batch_records = []
     all_results   = []
-    example_data  = []   # store raw arrays for a few tiles
+    example_data  = []
 
-    # Accumulators for global fit (reservoir sample to keep memory bounded)
     MAX_GLOBAL_PIXELS = 5_000_000
-    global_I = []
-    global_Z = []
-    global_count = 0
+    global_I, global_Z, global_count = [], [], 0
 
-    todo = [(a, r, tid) for a, r, tid in pairs if tid not in completed]
+    todo = [(tid, paths) for tid, paths in pairs if tid not in completed]
     print(f"  To process: {len(todo)} tiles")
 
-    for aerial_path, resist_path, tile_id in tqdm(
-            todo, desc=f"{dataset}", unit="tile", dynamic_ncols=True):
-
-        aerial = load_tile(aerial_path)
-        resist = load_tile(resist_path)
-
+    for tile_id, paths in tqdm(todo, desc=dataset, unit="tile", dynamic_ncols=True):
+        aerial = load_tile(paths["aerial"])
+        resist = load_tile(paths["resist"])
         if aerial is None or resist is None:
             continue
         if aerial.shape != resist.shape:
@@ -487,12 +592,11 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
         result = fit_tile(aerial, resist, max_pixels=max_pixels, rng=rng)
 
         if result is not None:
-            result["tile_id"]  = tile_id
-            result["dataset"]  = dataset
+            result["tile_id"] = tile_id
+            result["dataset"] = dataset
             all_results.append(result)
             batch_records.append(result)
 
-            # Accumulate pixels for global fit (bounded)
             if global_count < MAX_GLOBAL_PIXELS:
                 I_flat = aerial.ravel().astype(np.float64)
                 Z_flat = resist.ravel().astype(np.float64)
@@ -505,56 +609,44 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
                 global_Z.append(Z_flat)
                 global_count += len(I_flat)
 
-            # Collect example tiles (high R²)
             if len(example_data) < n_examples and result["r2"] > 0.95:
                 example_data.append({
-                    "aerial": aerial,
-                    "resist": resist,
-                    "alpha":  result["alpha"],
-                    "Ith":    result["Ith"],
-                    "r2":     result["r2"],
+                    "aerial": aerial, "resist": resist,
+                    "alpha": result["alpha"], "Ith": result["Ith"],
+                    "r2": result["r2"],
                 })
 
-        # Save progress every 500 tiles
         if len(batch_records) >= 500:
             save_completed(output_dir, dataset, batch_records)
             batch_records = []
 
-    # Save remaining
     if batch_records:
         save_completed(output_dir, dataset, batch_records)
 
-    # Load ALL completed records (including prior runs)
     csv_path = output_dir / dataset / COMPLETED_CSV
     if csv_path.exists():
         df = pd.read_csv(csv_path)
     else:
         if not all_results:
-            print("  [WARN] No results to analyse.")
+            print("  [WARN] No results.")
             return None
         df = pd.DataFrame(all_results)
 
-    # Filter bad fits
     df = df[df["r2"] > 0.5].copy()
-    print(f"\n  Tiles with R²>0.5: {len(df)} / {len(pairs)}")
-
+    print(f"\n  Tiles with R2>0.5: {len(df)} / {len(pairs)}")
     if len(df) == 0:
-        print("  [WARN] No good fits. Check data paths.")
         return None
 
-    # ── Summary statistics ────────────────────────────────────────────────────
     print(f"\n  Per-tile statistics:")
-    print(f"    alpha  — median: {df['alpha'].median():.2f}  "
-          f"std: {df['alpha'].std():.2f}  "
-          f"[{df['alpha'].quantile(0.05):.1f}, {df['alpha'].quantile(0.95):.1f}]")
-    print(f"    Ith    — median: {df['Ith'].median():.5f}  "
-          f"std: {df['Ith'].std():.5f}  "
-          f"[{df['Ith'].quantile(0.05):.5f}, {df['Ith'].quantile(0.95):.5f}]")
-    print(f"    R²     — median: {df['r2'].median():.4f}  "
-          f"min: {df['r2'].min():.4f}")
+    print(f"    alpha — median: {df['alpha'].median():.2f}  std: {df['alpha'].std():.2f}")
+    print(f"    Ith   — median: {df['Ith'].median():.5f}  std: {df['Ith'].std():.5f}")
+    print(f"    R2    — median: {df['r2'].median():.4f}  min: {df['r2'].min():.4f}")
 
-    # ── Global fit ────────────────────────────────────────────────────────────
-    global_alpha, global_Ith = None, None
+    global_alpha = float(df["alpha"].median())
+    global_Ith   = float(df["Ith"].median())
+    global_r2    = float("nan")
+    global_rmse  = float("nan")
+
     if global_I:
         all_I = np.concatenate(global_I)
         all_Z = np.concatenate(global_Z)
@@ -566,44 +658,28 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
                 popt, _ = curve_fit(sigmoid, all_I, all_Z,
                                     p0=p0, bounds=bounds, maxfev=10000)
             global_alpha, global_Ith = float(popt[0]), float(popt[1])
-            Z_pred_global = sigmoid(all_I, global_alpha, global_Ith)
-            global_rmse   = float(np.sqrt(np.mean((all_Z - Z_pred_global)**2)))
-            ss_res = np.sum((all_Z - Z_pred_global)**2)
-            ss_tot = np.sum((all_Z - all_Z.mean())**2)
+            Z_pred      = sigmoid(all_I, global_alpha, global_Ith)
+            global_rmse = float(np.sqrt(np.mean((all_Z - Z_pred) ** 2)))
+            ss_res = np.sum((all_Z - Z_pred) ** 2)
+            ss_tot = np.sum((all_Z - all_Z.mean()) ** 2)
             global_r2 = float(1.0 - ss_res / ss_tot)
 
-            print(f"\n  Global fit (pooled pixels: {len(all_I):,}):")
+            print(f"\n  Global fit ({len(all_I):,} pixels):")
             print(f"    alpha = {global_alpha:.2f}")
             print(f"    Ith   = {global_Ith:.6f}")
-            print(f"    R²    = {global_r2:.6f}")
+            print(f"    R2    = {global_r2:.6f}")
             print(f"    RMSE  = {global_rmse:.6f}")
-            print(f"\n  => Printed binarisation threshold on aerial: I > {global_Ith:.6f}")
+            print(f"\n  => Binarisation threshold: aerial > {global_Ith:.6f}")
 
-            plot_global_fit(all_I, all_Z, global_alpha, global_Ith,
-                            dataset, output_dir)
+            plot_global_fit(all_I, all_Z, global_alpha, global_Ith, dataset, output_dir)
         except Exception as e:
             print(f"  [WARN] Global fit failed: {e}")
-            global_alpha = float(df["alpha"].median())
-            global_Ith   = float(df["Ith"].median())
-            global_rmse  = float("nan")
-            global_r2    = float("nan")
-    else:
-        global_alpha = float(df["alpha"].median())
-        global_Ith   = float(df["Ith"].median())
-        global_rmse  = float("nan")
-        global_r2    = float("nan")
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
     plot_parameter_distributions(df, dataset, output_dir)
     plot_alpha_vs_Ith(df, dataset, output_dir)
-
     if example_data:
         plot_example_tiles(example_data, dataset, output_dir)
-    else:
-        # Fall back: use best R² tiles from df
-        print("  [INFO] No example tiles with R²>0.95 found for tile plots.")
 
-    # ── Return summary ────────────────────────────────────────────────────────
     return {
         "dataset":       dataset,
         "n_tiles_total": len(pairs),
@@ -615,8 +691,8 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
         "median_r2":     float(df["r2"].median()),
         "global_alpha":  global_alpha,
         "global_Ith":    global_Ith,
-        "global_r2":     global_r2 if "global_r2" in dir() else float("nan"),
-        "global_rmse":   global_rmse if "global_rmse" in dir() else float("nan"),
+        "global_r2":     global_r2,
+        "global_rmse":   global_rmse,
     }
 
 
@@ -626,33 +702,33 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Sigmoid parameter study for LithoBench (aerial → resist)."
+        description="Sigmoid parameter study + threshold validation for LithoBench."
     )
-    parser.add_argument(
-        "--data-root", type=Path, required=True,
-        help="Root directory of LithoBench (contains MetalSet/, ViaSet/, etc.)"
-    )
-    parser.add_argument(
-        "--datasets", nargs="+", default=["MetalSet"],
-        choices=DATASETS,
-        help="Datasets to process (default: MetalSet)"
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("./sigmoidstudy_results"),
-        help="Directory for outputs (default: ./sigmoidstudy_results)"
-    )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="Resume from previously completed tiles"
-    )
-    parser.add_argument(
-        "--max-pixels-per-tile", type=int, default=None,
-        help="Subsample pixels per tile for speed (default: use all pixels)"
-    )
-    parser.add_argument(
-        "--n-examples", type=int, default=4,
-        help="Number of example tile visualisations (default: 4)"
-    )
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--datasets", nargs="+", default=["MetalSet"], choices=DATASETS)
+    parser.add_argument("--output-dir", type=Path, default=Path("./sigmoidstudy_results"))
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--max-pixels-per-tile", type=int, default=None)
+    parser.add_argument("--n-examples", type=int, default=4)
+
+    # Sigmoid curve plot
+    parser.add_argument("--plot-sigmoid", action="store_true",
+                        help="Plot sigmoid curve(s) from stored results (no refitting)")
+    parser.add_argument("--plot-datasets", nargs="+", default=None, choices=DATASETS,
+                        help="Datasets for sigmoid curve plot (default: same as --datasets)")
+    parser.add_argument("--sigmoid-I-min", type=float, default=0.0)
+    parser.add_argument("--sigmoid-I-max", type=float, default=1.0)
+    parser.add_argument("--sigmoid-no-annotations", action="store_true")
+    parser.add_argument("--sigmoid-dpi", type=int, default=150)
+
+    # Threshold validation
+    parser.add_argument("--validate-threshold", action="store_true",
+                        help="Validate aerial > Ith against ground truth printed images")
+    parser.add_argument("--threshold-override", type=float, default=None,
+                        help="Override fitted Ith with this value for validation")
+    parser.add_argument("--validate-max-tiles", type=int, default=None,
+                        help="Limit tiles for validation (default: all)")
+
     return parser.parse_args()
 
 
@@ -667,43 +743,86 @@ def main():
     print(f"  Resume     : {args.resume}")
     print(f"  Max px/tile: {args.max_pixels_per_tile or 'all'}")
 
-    all_results = {}
     t0 = time.time()
 
-    for dataset in args.datasets:
-        result = run_dataset(
-            dataset      = dataset,
-            data_root    = args.data_root,
-            output_dir   = args.output_dir,
-            resume       = args.resume,
-            max_pixels   = args.max_pixels_per_tile,
-            n_examples   = args.n_examples,
-        )
-        if result is not None:
-            all_results[dataset] = result
-
-    # ── Cross-dataset summary ─────────────────────────────────────────────────
-    if len(all_results) >= 2:
-        plot_cross_dataset_summary(all_results, args.output_dir)
-
-    # ── Save JSON results ─────────────────────────────────────────────────────
+    # Load existing results if available
+    all_results  = {}
     results_path = args.output_dir / RESULTS_JSON
-    with open(results_path, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nResults saved: {results_path}")
+    if results_path.exists():
+        with open(results_path) as f:
+            all_results = json.load(f)
 
-    # ── Final summary table ───────────────────────────────────────────────────
+    # Skip refitting if only plotting/validating and results already exist
+    skip_fit = (args.plot_sigmoid or args.validate_threshold) and \
+               all(ds in all_results for ds in args.datasets)
+
+    if not skip_fit:
+        for dataset in args.datasets:
+            result = run_dataset(
+                dataset    = dataset,
+                data_root  = args.data_root,
+                output_dir = args.output_dir,
+                resume     = args.resume,
+                max_pixels = args.max_pixels_per_tile,
+                n_examples = args.n_examples,
+            )
+            if result is not None:
+                all_results[dataset] = result
+
+        if len(all_results) >= 2:
+            plot_cross_dataset_summary(all_results, args.output_dir)
+
+        with open(results_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\nResults saved: {results_path}")
+
+    # Sigmoid curve plots (always generated after fitting, or on demand)
+    plot_targets = args.plot_datasets or args.datasets
+    if args.plot_sigmoid or not skip_fit:
+        for ds in plot_targets:
+            if ds in all_results:
+                res = all_results[ds]
+                plot_sigmoid_curve(
+                    alpha            = res["global_alpha"],
+                    Ith              = res["global_Ith"],
+                    dataset          = ds,
+                    output_dir       = args.output_dir,
+                    I_range          = (args.sigmoid_I_min, args.sigmoid_I_max),
+                    show_annotations = not args.sigmoid_no_annotations,
+                    dpi              = args.sigmoid_dpi,
+                )
+            else:
+                print(f"  [WARN] No results for {ds} — run study first.")
+
+    # Threshold validation
+    if args.validate_threshold:
+        for ds in args.datasets:
+            if ds not in all_results:
+                print(f"  [WARN] No fitted results for {ds}. Run study first.")
+                continue
+            Ith = (args.threshold_override
+                   if args.threshold_override is not None
+                   else all_results[ds]["global_Ith"])
+            run_threshold_validation(
+                dataset    = ds,
+                data_root  = args.data_root,
+                output_dir = args.output_dir,
+                Ith        = Ith,
+                n_examples = args.n_examples,
+                max_tiles  = args.validate_max_tiles,
+            )
+
+    # Final summary
     print(f"\n{'='*60}")
     print(f"  FINAL SUMMARY")
     print(f"{'='*60}")
-    print(f"  {'Dataset':<14} {'α (global)':>12} {'I_th (global)':>14} "
-          f"{'R² (global)':>12} {'Tiles fit':>10}")
-    print(f"  {'-'*65}")
+    print(f"  {'Dataset':<14} {'alpha':>8} {'I_th':>10} {'R2':>10} {'Tiles':>10}")
+    print(f"  {'-'*55}")
     for ds, res in all_results.items():
-        print(f"  {ds:<14} {res['global_alpha']:>12.2f} "
-              f"{res['global_Ith']:>14.6f} "
-              f"{res.get('global_r2', float('nan')):>12.6f} "
-              f"{res['n_tiles_fit']:>10} / {res['n_tiles_total']}")
+        print(f"  {ds:<14} {res['global_alpha']:>8.2f} "
+              f"{res['global_Ith']:>10.6f} "
+              f"{res.get('global_r2', float('nan')):>10.6f} "
+              f"{res['n_tiles_fit']:>5} / {res['n_tiles_total']}")
 
     print(f"\n  Total time: {(time.time()-t0)/60:.1f} min")
     print(f"  Outputs in: {args.output_dir}\n")
