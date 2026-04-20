@@ -1,0 +1,16 @@
+{
+  "MetalSet": {
+    "dataset": "MetalSet",
+    "n_tiles_total": 16422,
+    "n_tiles_fit": 16422,
+    "median_alpha": 49.99439707482418,
+    "std_alpha": 0.1691176180579765,
+    "median_Ith": 0.22500450842956254,
+    "std_Ith": 0.00013816812339222594,
+    "median_r2": 0.9998493830507325,
+    "global_alpha": 49.99781897217098,
+    "global_Ith": 0.22499854586764578,
+    "global_r2": 0.9998428158495659,
+    "global_rmse": 0.0024226531596050066
+  }
+}
