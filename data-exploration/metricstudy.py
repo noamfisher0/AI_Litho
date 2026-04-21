@@ -141,40 +141,50 @@ DEFAULT_EPE_BIN_THRESHOLD = 0.5    # candidate binarisation threshold for EPE
                                    # 0.5 = sigmoid midpoint = physical I_th
 
 def _build_data_dict(data_root: Path) -> dict:
-    """Build the flat DATA_DICT from a resolved data root path."""
     return {
-        # ── MetalSet ──────────────────────────────────────────────────────────
+        # ── MetalSet ──
         "MetalSet-Printed":   str(data_root / "MetalSet"       / "printed"),
         "MetalSet-Resist":    str(data_root / "MetalSet"       / "resist"),
+        "MetalSet-Litho":     str(data_root / "MetalSet"       / "litho"),   # NEW
         "MetalSet-Target":    str(data_root / "MetalSet"       / "target"),
-        # ── ViaSet ────────────────────────────────────────────────────────────
+        # ── ViaSet ──
         "ViaSet-Printed":     str(data_root / "ViaSet"         / "printed"),
         "ViaSet-Resist":      str(data_root / "ViaSet"         / "resist"),
+        "ViaSet-Litho":       str(data_root / "ViaSet"         / "litho"),   # NEW
         "ViaSet-Target":      str(data_root / "ViaSet"         / "target"),
-        # ── StdMetal ──────────────────────────────────────────────────────────
+        # ── StdMetal ──
         "StdMetal-Printed":   str(data_root / "StdMetal"       / "printed"),
         "StdMetal-Resist":    str(data_root / "StdMetal"       / "resist"),
+        "StdMetal-Litho":     str(data_root / "StdMetal"       / "litho"),   # NEW
         "StdMetal-Target":    str(data_root / "StdMetal"       / "target"),
-        # ── StdContact ────────────────────────────────────────────────────────
+        # ── StdContact ──
         "StdContact-Printed": str(data_root / "StdContactFull" / "printed"),
         "StdContact-Resist":  str(data_root / "StdContactFull" / "resist"),
+        "StdContact-Litho":   str(data_root / "StdContactFull" / "litho"),   # NEW
         "StdContact-Target":  str(data_root / "StdContactFull" / "target"),
     }
-
 # ── CSV schemas ───────────────────────────────────────────────────────────────
 
+# For Printed and Resist the reference is Target (ILT quality).
+# For Litho the reference is Printed (lithography simulation quality —
+# how well the aerial image predicts the binarised printed pattern).
+CANDIDATE_REFERENCE_MAP = {
+    "printed": "target",
+    "resist":  "target",
+    "litho":   "printed",
+}
+
 PER_IMAGE_FIELDS = [
-    "subset", "dataset", "datatype", "filename",
+    "subset", "dataset", "datatype", "reference", "filename",
     "l2_sq", "epe_violations",
 ]
 
 AVERAGED_FIELDS = [
-    "subset", "dataset", "datatype",
+    "subset", "dataset", "datatype", "reference",
     "num_samples",
     "mean_l2_sq",  "std_l2_sq",
     "mean_epe",    "std_epe",
 ]
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -498,7 +508,7 @@ def _process_pair(task: tuple):
     import matplotlib
     matplotlib.use("Agg")
 
-    (subset, dataset, datatype, filename,
+    (subset, dataset, datatype, reference, filename,
      cand_path_str, tgt_path_str,
      epe_spacing, epe_threshold, epe_bin_threshold, log_file) = task
 
@@ -530,6 +540,7 @@ def _process_pair(task: tuple):
             "subset":         subset,
             "dataset":        dataset,
             "datatype":       datatype,
+            "reference":      reference,   # NEW
             "filename":       filename,
             "l2_sq":          round(l2_sq, 4),
             "epe_violations": epe,
@@ -555,13 +566,16 @@ def _process_pair_batch(batch_tasks: list):
 # ──────────────────────────────────────────────────────────────────────────────
 # Aggregation
 # ──────────────────────────────────────────────────────────────────────────────
-
 def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
     """
     Read metrics_per_image.csv and compute mean + std per subset,
     writing results to metrics_averaged.csv.
+
+    The 'reference' column is read from each row if present (new runs),
+    or falls back to 'Target' for backward compatibility with CSVs written
+    before the Litho candidate was added.
     """
-    records: dict = {}  # subset → {"l2": [...], "epe": [...], "dataset": ..., "datatype": ...}
+    records: dict = {}  # subset → {"l2": [...], "epe": [...], "dataset": ..., "datatype": ..., "reference": ...}
 
     with open(per_image_csv, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -579,8 +593,9 @@ def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
                 continue
             if s not in records:
                 records[s] = {
-                    "dataset":  row["dataset"],
-                    "datatype": row["datatype"],
+                    "dataset":   row["dataset"],
+                    "datatype":  row["datatype"],
+                    "reference": row.get("reference", "Target"),  # backward-compat fallback
                     "l2":  [],
                     "epe": [],
                 }
@@ -598,6 +613,7 @@ def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
                 "subset":      subset,
                 "dataset":     r["dataset"],
                 "datatype":    r["datatype"],
+                "reference":   r["reference"],
                 "num_samples": len(l2),
                 "mean_l2_sq":  round(float(np.mean(l2)), 4),
                 "std_l2_sq":   round(float(np.std(l2)),  4),
@@ -606,12 +622,9 @@ def aggregate_to_averaged_csv(per_image_csv: Path, averaged_csv: Path):
             })
 
     return averaged_csv
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Evaluation orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
-
 def run_evaluation(
     data_dict:         dict,
     output_dir:        Path,
@@ -623,12 +636,18 @@ def run_evaluation(
     epe_spacing:       int   = DEFAULT_EPE_SPACING,
     epe_threshold:     float = DEFAULT_EPE_THRESHOLD,
     epe_bin_threshold: float = DEFAULT_EPE_BIN_THRESHOLD,
-    candidates:        list  = None,   # e.g. ["printed"], ["resist"], or both
+    candidates:        list  = None,   # e.g. ["printed"], ["resist"], ["litho"], or any combo
 ):
     """
     Build a flat image-pair work queue for all (dataset, datatype) combinations,
     dispatch to a ProcessPoolExecutor, stream results to metrics_per_image.csv,
     then aggregate to metrics_averaged.csv.
+
+    The reference image for each candidate type is determined by
+    CANDIDATE_REFERENCE_MAP:
+        printed → target   (ILT mask optimisation quality)
+        resist  → target   (ILT mask optimisation quality)
+        litho   → printed  (lithography simulation quality: aerial vs binary printed)
     """
     import tqdm
 
@@ -650,7 +669,10 @@ def run_evaluation(
     print("Scanning dataset directories ...")
     tasks = []
 
-    # Build nested lookup: dataset -> {datatype -> dir_path}
+    # Resolve which candidate datatypes to evaluate
+    active_candidates = [c.lower() for c in candidates] if candidates else ["printed", "resist"]
+
+    # Build nested lookup: dataset -> {datatype_lower -> dir_path}
     # from the flat DATA_DICT keys ("Dataset-Datatype")
     nested: dict = {}
     for key, path in data_dict.items():
@@ -658,23 +680,36 @@ def run_evaluation(
         nested.setdefault(ds, {})[dt.lower()] = Path(path)
 
     for dataset, dt_map in nested.items():
-        tgt_dir = dt_map.get("target")
-        if tgt_dir is None or not tgt_dir.exists():
-            print(f"  WARNING: target dir not found — skipping {dataset}")
-            logger.warning(f"Target dir not found, skipping dataset: {dataset}")
-            continue
-
-        tgt_files = {f.name: f for f in sorted(tgt_dir.iterdir()) if f.is_file()}
-
-        active_candidates = [c.lower() for c in candidates] if candidates else ["printed", "resist"]
         for datatype in active_candidates:
             cand_dir = dt_map.get(datatype)
             if cand_dir is None or not cand_dir.exists():
-                logger.info(f"No {datatype} dir for {dataset}, skipping.")
+                logger.info(f"No '{datatype}' dir for {dataset}, skipping.")
+                continue
+
+            # Resolve the reference datatype for this candidate
+            ref_key = CANDIDATE_REFERENCE_MAP.get(datatype, "target")
+            ref_dir = dt_map.get(ref_key)
+            if ref_dir is None or not ref_dir.exists():
+                print(
+                    f"  WARNING: reference '{ref_key}' dir not found for "
+                    f"{dataset}/{datatype} — skipping"
+                )
+                logger.warning(
+                    f"Reference dir '{ref_key}' not found for "
+                    f"{dataset}/{datatype}, skipping."
+                )
                 continue
 
             cand_files = {f.name: f for f in sorted(cand_dir.iterdir()) if f.is_file()}
-            common     = sorted(set(tgt_files) & set(cand_files))
+            ref_files  = {f.name: f for f in sorted(ref_dir.iterdir())  if f.is_file()}
+            common     = sorted(set(cand_files) & set(ref_files))
+
+            if not common:
+                logger.info(
+                    f"No overlapping filenames between '{datatype}' and "
+                    f"'{ref_key}' for {dataset}, skipping."
+                )
+                continue
 
             if num_samples is not None:
                 common = random.sample(common, min(num_samples, len(common)))
@@ -685,19 +720,26 @@ def run_evaluation(
                 if (subset, fname) in completed:
                     continue
                 tasks.append((
-                    subset, dataset, datatype.capitalize(),
+                    subset,
+                    dataset,
+                    datatype.capitalize(),
+                    ref_key.capitalize(),        # reference column value
                     fname,
                     str(cand_files[fname]),
-                    str(tgt_files[fname]),
-                    epe_spacing, epe_threshold, epe_bin_threshold,
+                    str(ref_files[fname]),
+                    epe_spacing,
+                    epe_threshold,
+                    epe_bin_threshold,
                     str(LOG_FILE),
                 ))
 
     pending = len(tasks)
 
     if completed:
-        print(f"\nResuming — {len(completed)} pairs already done, "
-              f"{pending} remaining.\n")
+        print(
+            f"\nResuming — {len(completed)} pairs already done, "
+            f"{pending} remaining.\n"
+        )
     else:
         print(f"\nStarting fresh — {pending} image pairs to process.\n")
 
@@ -708,9 +750,11 @@ def run_evaluation(
             aggregate_to_averaged_csv(per_image_csv, averaged_csv)
             print(f"metrics_averaged.csv written to: {averaged_csv}")
         else:
-            print("No image pairs found. Check that DATA_ROOT points to your "
-                  "lithobench-main directory and that printed/resist/target "
-                  "subdirectories exist.")
+            print(
+                "No image pairs found. Check that DATA_ROOT points to your "
+                "lithobench-main directory and that the expected subdirectories "
+                "exist for each candidate/reference pair."
+            )
             logger.warning("No pairs found and no prior results — nothing to do.")
         return per_image_csv, averaged_csv
 
@@ -752,9 +796,9 @@ def run_evaluation(
             file=sys.stdout,
         ) as pbar:
             for future in cf.as_completed(future_to_batch):
-                batch        = future_to_batch[future]
-                first_subset = batch[0][0]
-                first_file   = batch[0][3]
+                batch         = future_to_batch[future]
+                first_subset  = batch[0][0]
+                first_file    = batch[0][4]   # filename is now index 4 (after reference)
                 batch_timeout = max(timeout, timeout * len(batch))
 
                 try:
@@ -782,8 +826,10 @@ def run_evaluation(
 
     issues = failed + timedout
     if issues:
-        print(f"\n  {failed} failed, {timedout} timed out. "
-              f"See {LOG_FILE} for details.")
+        print(
+            f"\n  {failed} failed, {timedout} timed out. "
+            f"See {LOG_FILE} for details."
+        )
     else:
         print("\n  All pairs processed successfully.")
 
@@ -794,8 +840,6 @@ def run_evaluation(
     print(f"  metrics_averaged.csv  : {averaged_csv}")
 
     return per_image_csv, averaged_csv
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Terminal table
 # ──────────────────────────────────────────────────────────────────────────────
@@ -813,6 +857,7 @@ def print_tables(averaged_csv: Path):
     cw = {"dt": 10, "n": 7, "ml2": 14, "sl2": 14, "mepe": 10, "sepe": 10}
     header = (
         f"{'Datatype':<{cw['dt']}}"
+        f"  {'Reference':<10}"
         f"  {'N':>{cw['n']}}"
         f"  {'Mean L2²':>{cw['ml2']}}"
         f"  {'Std L2²':>{cw['sl2']}}"
@@ -1142,10 +1187,10 @@ def parse_args():
                         f"Has no effect on the already-binary Printed datatype.")
     args = p.parse_args()
     if args.candidates:
-        valid = {"printed", "resist"}
+        valid = {"printed", "resist", "litho"}   # add "litho"
         bad = [c for c in args.candidates if c.lower() not in valid]
         if bad:
-            p.error(f"--candidates: invalid choice(s): {bad}. Choose from Printed, Resist.")
+            p.error(f"--candidates: invalid choice(s): {bad}. Choose from Printed, Resist, Litho.")
     return args
 
 
