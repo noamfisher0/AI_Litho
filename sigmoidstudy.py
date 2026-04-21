@@ -14,19 +14,22 @@ for printed binarisation (Ith, corresponding to Z=0.5).
 Also supports --validate-threshold to verify that aerial > Ith reproduces
 the ground truth printed images (IOU, pixel accuracy, visual examples).
 
+Parallelism
+-----------
+Both the fitting loop and the validation loop use ProcessPoolExecutor for
+CPU-bound parallelism. Use --num-workers to control concurrency (default: 4).
+Set --num-workers 1 to disable multiprocessing (useful for debugging).
+
 Usage
 -----
-# Full run on MetalSet (aerial + resist)
-python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet
+# Full run on MetalSet with 8 workers
+python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --num-workers 8
 
 # Resume a partial run
 python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --resume
 
-# Validate threshold against printed ground truth (uses stored results)
+# Validate threshold against printed ground truth
 python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --validate-threshold
-
-# Validate with a custom threshold override
-python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --validate-threshold --threshold-override 0.225
 
 # Sigmoid curve plot only (no refitting)
 python sigmoidstudy.py --data-root /path/to/lithobench --datasets MetalSet --plot-sigmoid
@@ -37,6 +40,7 @@ import json
 import pickle
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import matplotlib
@@ -103,7 +107,7 @@ def load_tile(path: Path):
 
 def find_tile_pairs(data_root: Path, dataset: str, keys: list):
     """
-    Find matched tile file tuples for given keys (e.g. ['aerial','resist','printed']).
+    Find matched tile file tuples for given keys.
     Returns list of (tile_id, {key: path}) tuples.
     Only tiles present in ALL keys are returned.
     """
@@ -154,24 +158,49 @@ def save_completed(output_dir: Path, dataset: str, records: list):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-tile fitting
+# Worker functions (module-level so they are picklable for multiprocessing)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fit_tile(aerial: np.ndarray, resist: np.ndarray,
-             max_pixels: int = None, rng=None):
+def _fit_worker(args_tuple):
+    """
+    Worker for ProcessPoolExecutor — fits sigmoid to one tile.
+    args_tuple: (tile_id, aerial_path, resist_path, max_pixels, seed)
+    Returns (tile_id, result_dict_or_None, I_flat, Z_flat)
+    """
+    tile_id, aerial_path, resist_path, max_pixels, seed = args_tuple
+
+    aerial = load_tile(Path(aerial_path))
+    resist = load_tile(Path(resist_path))
+
+    if aerial is None or resist is None:
+        return tile_id, None, None, None
+    if aerial.shape != resist.shape:
+        return tile_id, None, None, None
+
     I = aerial.ravel().astype(np.float64)
     Z = resist.ravel().astype(np.float64)
     mask = ~((I < 1e-6) & (Z < 1e-6))
     I, Z = I[mask], Z[mask]
+
     if len(I) < 50:
-        return None
+        return tile_id, None, None, None
+
+    rng = np.random.default_rng(seed)
     if max_pixels is not None and len(I) > max_pixels:
-        if rng is None:
-            rng = np.random.default_rng(42)
         idx = rng.choice(len(I), size=max_pixels, replace=False)
         I, Z = I[idx], Z[idx]
+
+    # Save a subsample for the global fit accumulator
+    MAX_GLOBAL_SAMPLE = 2048
+    if len(I) > MAX_GLOBAL_SAMPLE:
+        idx2 = rng.choice(len(I), size=MAX_GLOBAL_SAMPLE, replace=False)
+        I_global, Z_global = I[idx2], Z[idx2]
+    else:
+        I_global, Z_global = I.copy(), Z.copy()
+
     p0     = [100.0, float(np.median(I))]
     bounds = ([1.0, 0.0], [1e5, 1.0])
+
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -182,23 +211,37 @@ def fit_tile(aerial: np.ndarray, resist: np.ndarray,
         ss_tot = np.sum((Z - Z.mean()) ** 2)
         r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
         rmse   = float(np.sqrt(np.mean((Z - Z_pred) ** 2)))
-        return {"alpha": float(alpha), "Ith": float(Ith),
-                "r2": float(r2), "rmse": rmse, "n_pixels": int(len(I))}
+        result = {"alpha": float(alpha), "Ith": float(Ith),
+                  "r2": float(r2), "rmse": rmse, "n_pixels": int(len(I))}
+        return tile_id, result, I_global, Z_global
     except Exception:
-        return None
+        return tile_id, None, None, None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Threshold validation metrics
-# ──────────────────────────────────────────────────────────────────────────────
+def _validate_worker(args_tuple):
+    """
+    Worker for ProcessPoolExecutor — computes threshold metrics for one tile.
+    args_tuple: (tile_id, aerial_path, printed_path, Ith)
+    Returns (tile_id, metrics_dict_or_None, aerial_array, printed_array)
+    """
+    tile_id, aerial_path, printed_path, Ith = args_tuple
 
-def compute_threshold_metrics(aerial: np.ndarray, printed_gt: np.ndarray, Ith: float):
+    aerial  = load_tile(Path(aerial_path))
+    printed = load_tile(Path(printed_path))
+
+    if aerial is None or printed is None:
+        return tile_id, None, None, None
+    if aerial.shape != printed.shape:
+        return tile_id, None, None, None
+
     pred = (aerial > Ith).astype(np.uint8)
-    gt   = (printed_gt > 0.5).astype(np.uint8)
+    gt   = (printed > 0.5).astype(np.uint8)
+
     tp = int(np.sum((pred == 1) & (gt == 1)))
     fp = int(np.sum((pred == 1) & (gt == 0)))
     fn = int(np.sum((pred == 0) & (gt == 1)))
     tn = int(np.sum((pred == 0) & (gt == 0)))
+
     iou       = tp / (tp + fp + fn + 1e-8)
     pa        = (tp + tn) / (tp + fp + fn + tn + 1e-8)
     precision = tp / (tp + fp + 1e-8)
@@ -206,10 +249,13 @@ def compute_threshold_metrics(aerial: np.ndarray, printed_gt: np.ndarray, Ith: f
     f1        = 2 * precision * recall / (precision + recall + 1e-8)
     fpr       = fp / (fp + tn + 1e-8)
     fnr       = fn / (fn + tp + 1e-8)
-    return {"iou": iou, "pa": pa, "f1": f1,
-            "precision": precision, "recall": recall,
-            "fpr": fpr, "fnr": fnr,
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+    metrics = {"iou": iou, "pa": pa, "f1": f1,
+               "precision": precision, "recall": recall,
+               "fpr": fpr, "fnr": fnr,
+               "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+    return tile_id, metrics, aerial, printed
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,10 +417,6 @@ def plot_sigmoid_curve(alpha: float, Ith: float, dataset: str,
     print(f"  Saved: {out}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Visualisations — threshold validation
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_threshold_validation(metrics_df: pd.DataFrame, example_records: list,
                                dataset: str, Ith: float, output_dir: Path):
     # Metric distributions
@@ -423,7 +465,7 @@ def plot_threshold_validation(metrics_df: pd.DataFrame, example_records: list,
     plt.close()
     print(f"  Saved: {out}")
 
-    # Example tile grid: aerial | pred | GT | error
+    # Example tile grid
     n = len(example_records)
     if n == 0:
         return
@@ -439,7 +481,7 @@ def plot_threshold_validation(metrics_df: pd.DataFrame, example_records: list,
         gt      = rec["printed_gt"]
         pred    = (aerial > Ith).astype(np.float32)
         gt_bin  = (gt > 0.5).astype(np.float32)
-        error   = pred - gt_bin   # +1=FP, -1=FN
+        error   = pred - gt_bin
         ims = [
             axes[i, 0].imshow(aerial, cmap="gray", vmin=aerial.min(), vmax=aerial.max()),
             axes[i, 1].imshow(pred,   cmap="gray", vmin=0, vmax=1),
@@ -487,77 +529,15 @@ def plot_cross_dataset_summary(all_results: dict, output_dir: Path):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Threshold validation pipeline
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_threshold_validation(dataset: str, data_root: Path, output_dir: Path,
-                              Ith: float, n_examples: int, max_tiles: int = None):
-    print(f"\n  Threshold Validation — {dataset}  (I_th={Ith:.4f})")
-    pairs = find_tile_pairs(data_root, dataset, keys=["aerial", "printed"])
-    if not pairs:
-        print("  [SKIP] No aerial+printed pairs found.")
-        return
-    if max_tiles:
-        pairs = pairs[:max_tiles]
-    print(f"  Validating on {len(pairs)} tiles...")
-
-    records      = []
-    example_data = []
-
-    for tile_id, paths in tqdm(pairs, desc=f"Validating {dataset}",
-                                unit="tile", dynamic_ncols=True):
-        aerial  = load_tile(paths["aerial"])
-        printed = load_tile(paths["printed"])
-        if aerial is None or printed is None:
-            continue
-        if aerial.shape != printed.shape:
-            continue
-        m = compute_threshold_metrics(aerial, printed, Ith)
-        m["tile_id"] = tile_id
-        records.append(m)
-        if len(example_data) < n_examples:
-            example_data.append({
-                "aerial":     aerial,
-                "printed_gt": printed,
-                "iou":        m["iou"],
-                "f1":         m["f1"],
-            })
-
-    if not records:
-        print("  [WARN] No valid tiles processed.")
-        return
-
-    df = pd.DataFrame(records)
-
-    print(f"\n  Threshold Validation Results (I_th={Ith:.4f}):")
-    print(f"    IOU            — mean: {df['iou'].mean():.4f}  "
-          f"median: {df['iou'].median():.4f}  std: {df['iou'].std():.4f}")
-    print(f"    F1             — mean: {df['f1'].mean():.4f}  "
-          f"median: {df['f1'].median():.4f}  std: {df['f1'].std():.4f}")
-    print(f"    Pixel Accuracy — mean: {df['pa'].mean():.4f}  "
-          f"median: {df['pa'].median():.4f}  std: {df['pa'].std():.4f}")
-    print(f"    Precision      — mean: {df['precision'].mean():.4f}")
-    print(f"    Recall         — mean: {df['recall'].mean():.4f}")
-    print(f"    FPR            — mean: {df['fpr'].mean():.4f}")
-    print(f"    FNR            — mean: {df['fnr'].mean():.4f}")
-
-    csv_out = output_dir / dataset / "threshold_validation_results.csv"
-    csv_out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(csv_out, index=False)
-    print(f"  Saved: {csv_out}")
-
-    plot_threshold_validation(df, example_data, dataset, Ith, output_dir)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main per-dataset fitting pipeline
+# Main per-dataset fitting pipeline (parallel)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_dataset(dataset: str, data_root: Path, output_dir: Path,
-                resume: bool, max_pixels: int, n_examples: int):
+                resume: bool, max_pixels: int, n_examples: int,
+                num_workers: int = 4, max_fit_tiles: int = None):
 
     print(f"\n{'='*60}")
-    print(f"  Dataset: {dataset}")
+    print(f"  Dataset: {dataset}  (workers={num_workers})")
     print(f"{'='*60}")
 
     pairs = find_tile_pairs(data_root, dataset, keys=["aerial", "resist"])
@@ -570,86 +550,163 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
     if completed:
         print(f"  Resuming: {len(completed)} tiles already processed")
 
-    rng           = np.random.default_rng(42)
-    batch_records = []
-    all_results   = []
-    example_data  = []
-
-    MAX_GLOBAL_PIXELS = 5_000_000
-    global_I, global_Z, global_count = [], [], 0
-
     todo = [(tid, paths) for tid, paths in pairs if tid not in completed]
     print(f"  To process: {len(todo)} tiles")
 
-    for tile_id, paths in tqdm(todo, desc=dataset, unit="tile", dynamic_ncols=True):
-        aerial = load_tile(paths["aerial"])
-        resist = load_tile(paths["resist"])
-        if aerial is None or resist is None:
-            continue
-        if aerial.shape != resist.shape:
-            continue
+    if not todo:
+        # All done — load existing CSV and go straight to analysis
+        csv_path = output_dir / dataset / COMPLETED_CSV
+        if csv_path.exists():
+            df = pd.read_csv(csv_path)
+            df = df[df["r2"] > 0.5].copy()
+        else:
+            print("  [WARN] Nothing to process and no CSV found.")
+            return None
+        global_alpha = float(df["alpha"].median())
+        global_Ith   = float(df["Ith"].median())
+        return _finalise_dataset(df, [], [], dataset, output_dir,
+                                 global_alpha, global_Ith, n_examples, len(pairs))
 
-        result = fit_tile(aerial, resist, max_pixels=max_pixels, rng=rng)
+    # Build worker arg tuples — use tile index as seed for reproducibility
+    worker_args = [
+        (tid,
+         str(paths["aerial"]),
+         str(paths["resist"]),
+         max_pixels,
+         i)                          # seed = index
+        for i, (tid, paths) in enumerate(todo)
+    ]
 
-        if result is not None:
+    all_records  = []
+    global_I     = []
+    global_Z     = []
+    example_data = []   # store raw arrays for n_examples tiles
+    batch_buffer = []
+
+    MAX_GLOBAL_PIXELS = 5_000_000
+
+    executor_cls = ProcessPoolExecutor if num_workers > 1 else None
+
+    if executor_cls is not None:
+        executor = executor_cls(max_workers=num_workers)
+        futures  = {executor.submit(_fit_worker, arg): arg for arg in worker_args}
+        pbar     = tqdm(total=len(futures), desc=dataset, unit="tile", dynamic_ncols=True)
+
+        for future in as_completed(futures):
+            tile_id, result, I_g, Z_g = future.result()
+            pbar.update(1)
+
+            if result is None:
+                continue
+
             result["tile_id"] = tile_id
             result["dataset"] = dataset
-            all_results.append(result)
-            batch_records.append(result)
+            all_records.append(result)
+            batch_buffer.append(result)
 
-            if global_count < MAX_GLOBAL_PIXELS:
-                I_flat = aerial.ravel().astype(np.float64)
-                Z_flat = resist.ravel().astype(np.float64)
-                mask   = ~((I_flat < 1e-6) & (Z_flat < 1e-6))
-                I_flat, Z_flat = I_flat[mask], Z_flat[mask]
-                if max_pixels and len(I_flat) > max_pixels:
-                    idx = rng.choice(len(I_flat), max_pixels, replace=False)
-                    I_flat, Z_flat = I_flat[idx], Z_flat[idx]
-                global_I.append(I_flat)
-                global_Z.append(Z_flat)
-                global_count += len(I_flat)
+            if I_g is not None and sum(len(x) for x in global_I) < MAX_GLOBAL_PIXELS:
+                global_I.append(I_g)
+                global_Z.append(Z_g)
 
             if len(example_data) < n_examples and result["r2"] > 0.95:
-                example_data.append({
-                    "aerial": aerial, "resist": resist,
-                    "alpha": result["alpha"], "Ith": result["Ith"],
-                    "r2": result["r2"],
-                })
+                aerial = load_tile(Path(futures[future][1]))
+                resist = load_tile(Path(futures[future][2]))
+                if aerial is not None and resist is not None:
+                    example_data.append({
+                        "aerial": aerial, "resist": resist,
+                        "alpha": result["alpha"], "Ith": result["Ith"],
+                        "r2": result["r2"],
+                    })
 
-        if len(batch_records) >= 500:
-            save_completed(output_dir, dataset, batch_records)
-            batch_records = []
+            if len(batch_buffer) >= 500:
+                save_completed(output_dir, dataset, batch_buffer)
+                batch_buffer = []
 
-    if batch_records:
-        save_completed(output_dir, dataset, batch_records)
+        pbar.close()
+        executor.shutdown(wait=False)
 
+    else:
+        # Single-process fallback (--num-workers 1)
+        for arg in tqdm(worker_args, desc=dataset, unit="tile", dynamic_ncols=True):
+            tile_id, result, I_g, Z_g = _fit_worker(arg)
+            if result is None:
+                continue
+            result["tile_id"] = tile_id
+            result["dataset"] = dataset
+            all_records.append(result)
+            batch_buffer.append(result)
+            if I_g is not None and sum(len(x) for x in global_I) < MAX_GLOBAL_PIXELS:
+                global_I.append(I_g)
+                global_Z.append(Z_g)
+            if len(example_data) < n_examples and result["r2"] > 0.95:
+                aerial = load_tile(Path(arg[1]))
+                resist = load_tile(Path(arg[2]))
+                if aerial is not None and resist is not None:
+                    example_data.append({
+                        "aerial": aerial, "resist": resist,
+                        "alpha": result["alpha"], "Ith": result["Ith"],
+                        "r2": result["r2"],
+                    })
+            if len(batch_buffer) >= 500:
+                save_completed(output_dir, dataset, batch_buffer)
+                batch_buffer = []
+
+    if batch_buffer:
+        save_completed(output_dir, dataset, batch_buffer)
+
+    # Reload full CSV (includes prior runs if resuming)
     csv_path = output_dir / dataset / COMPLETED_CSV
     if csv_path.exists():
         df = pd.read_csv(csv_path)
     else:
-        if not all_results:
+        if not all_records:
             print("  [WARN] No results.")
             return None
-        df = pd.DataFrame(all_results)
+        df = pd.DataFrame(all_records)
 
     df = df[df["r2"] > 0.5].copy()
     print(f"\n  Tiles with R2>0.5: {len(df)} / {len(pairs)}")
     if len(df) == 0:
         return None
 
+    # Global fit using accumulated pixel samples
+    global_alpha = float(df["alpha"].median())
+    global_Ith   = float(df["Ith"].median())
+
+    if global_I:
+        all_I = np.concatenate(global_I)
+        all_Z = np.concatenate(global_Z)
+        try:
+            p0     = [df["alpha"].median(), df["Ith"].median()]
+            bounds = ([1.0, 0.0], [1e5, 1.0])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                popt, _ = curve_fit(sigmoid, all_I, all_Z,
+                                    p0=p0, bounds=bounds, maxfev=10000)
+            global_alpha, global_Ith = float(popt[0]), float(popt[1])
+        except Exception as e:
+            print(f"  [WARN] Global fit failed: {e}")
+    else:
+        all_I, all_Z = np.array([]), np.array([])
+
+    return _finalise_dataset(df, all_I, all_Z, dataset, output_dir,
+                             global_alpha, global_Ith, n_examples, len(pairs),
+                             example_data)
+
+
+def _finalise_dataset(df, all_I, all_Z, dataset, output_dir,
+                      global_alpha, global_Ith, n_examples, n_total,
+                      example_data=None):
+    """Compute global fit stats, print summary, generate all plots."""
     print(f"\n  Per-tile statistics:")
     print(f"    alpha — median: {df['alpha'].median():.2f}  std: {df['alpha'].std():.2f}")
     print(f"    Ith   — median: {df['Ith'].median():.5f}  std: {df['Ith'].std():.5f}")
     print(f"    R2    — median: {df['r2'].median():.4f}  min: {df['r2'].min():.4f}")
 
-    global_alpha = float(df["alpha"].median())
-    global_Ith   = float(df["Ith"].median())
-    global_r2    = float("nan")
-    global_rmse  = float("nan")
+    global_r2   = float("nan")
+    global_rmse = float("nan")
 
-    if global_I:
-        all_I = np.concatenate(global_I)
-        all_Z = np.concatenate(global_Z)
+    if len(all_I) > 0:
         try:
             p0     = [df["alpha"].median(), df["Ith"].median()]
             bounds = ([1.0, 0.0], [1e5, 1.0])
@@ -673,7 +730,7 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
 
             plot_global_fit(all_I, all_Z, global_alpha, global_Ith, dataset, output_dir)
         except Exception as e:
-            print(f"  [WARN] Global fit failed: {e}")
+            print(f"  [WARN] Final global fit failed: {e}")
 
     plot_parameter_distributions(df, dataset, output_dir)
     plot_alpha_vs_Ith(df, dataset, output_dir)
@@ -682,7 +739,7 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
 
     return {
         "dataset":       dataset,
-        "n_tiles_total": len(pairs),
+        "n_tiles_total": n_total,
         "n_tiles_fit":   len(df),
         "median_alpha":  float(df["alpha"].median()),
         "std_alpha":     float(df["alpha"].std()),
@@ -694,6 +751,79 @@ def run_dataset(dataset: str, data_root: Path, output_dir: Path,
         "global_r2":     global_r2,
         "global_rmse":   global_rmse,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Threshold validation pipeline (parallel)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_threshold_validation(dataset: str, data_root: Path, output_dir: Path,
+                              Ith: float, n_examples: int,
+                              max_tiles: int = None, num_workers: int = 4):
+    print(f"\n  Threshold Validation — {dataset}  (I_th={Ith:.4f}, workers={num_workers})")
+
+    pairs = find_tile_pairs(data_root, dataset, keys=["aerial", "printed"])
+    if not pairs:
+        print("  [SKIP] No aerial+printed pairs found.")
+        return
+    if max_tiles:
+        pairs = pairs[:max_tiles]
+    print(f"  Validating on {len(pairs)} tiles...")
+
+    worker_args = [
+        (tid, str(paths["aerial"]), str(paths["printed"]), Ith)
+        for tid, paths in pairs
+    ]
+
+    records      = []
+    example_data = []
+
+    def _process_result(tile_id, metrics, aerial, printed):
+        if metrics is None:
+            return
+        metrics["tile_id"] = tile_id
+        records.append(metrics)
+        if len(example_data) < n_examples and aerial is not None:
+            example_data.append({
+                "aerial":     aerial,
+                "printed_gt": printed,
+                "iou":        metrics["iou"],
+                "f1":         metrics["f1"],
+            })
+
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_validate_worker, arg): arg for arg in worker_args}
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc=f"Validating {dataset}", unit="tile",
+                               dynamic_ncols=True):
+                tile_id, metrics, aerial, printed = future.result()
+                _process_result(tile_id, metrics, aerial, printed)
+    else:
+        for arg in tqdm(worker_args, desc=f"Validating {dataset}",
+                        unit="tile", dynamic_ncols=True):
+            tile_id, metrics, aerial, printed = _validate_worker(arg)
+            _process_result(tile_id, metrics, aerial, printed)
+
+    if not records:
+        print("  [WARN] No valid tiles processed.")
+        return
+
+    df = pd.DataFrame(records)
+
+    print(f"\n  Threshold Validation Results (I_th={Ith:.4f}):")
+    for col, label in [("iou", "IOU"), ("f1", "F1"),
+                       ("pa", "Pixel Acc"), ("precision", "Precision"),
+                       ("recall", "Recall"), ("fpr", "FPR"), ("fnr", "FNR")]:
+        print(f"    {label:<14} — mean: {df[col].mean():.4f}  "
+              f"median: {df[col].median():.4f}  std: {df[col].std():.4f}")
+
+    csv_out = output_dir / dataset / "threshold_validation_results.csv"
+    csv_out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_out, index=False)
+    print(f"  Saved: {csv_out}")
+
+    plot_threshold_validation(df, example_data, dataset, Ith, output_dir)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -710,12 +840,16 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-pixels-per-tile", type=int, default=None)
     parser.add_argument("--n-examples", type=int, default=4)
+    parser.add_argument(
+        "--num-workers", type=int, default=4,
+        help="Number of parallel worker processes. Set to 1 to disable multiprocessing "
+             "(default: 4). On HPC, match to available CPUs per task."
+    )
 
     # Sigmoid curve plot
     parser.add_argument("--plot-sigmoid", action="store_true",
                         help="Plot sigmoid curve(s) from stored results (no refitting)")
-    parser.add_argument("--plot-datasets", nargs="+", default=None, choices=DATASETS,
-                        help="Datasets for sigmoid curve plot (default: same as --datasets)")
+    parser.add_argument("--plot-datasets", nargs="+", default=None, choices=DATASETS)
     parser.add_argument("--sigmoid-I-min", type=float, default=0.0)
     parser.add_argument("--sigmoid-I-max", type=float, default=1.0)
     parser.add_argument("--sigmoid-no-annotations", action="store_true")
@@ -724,10 +858,8 @@ def parse_args():
     # Threshold validation
     parser.add_argument("--validate-threshold", action="store_true",
                         help="Validate aerial > Ith against ground truth printed images")
-    parser.add_argument("--threshold-override", type=float, default=None,
-                        help="Override fitted Ith with this value for validation")
-    parser.add_argument("--validate-max-tiles", type=int, default=None,
-                        help="Limit tiles for validation (default: all)")
+    parser.add_argument("--threshold-override", type=float, default=None)
+    parser.add_argument("--validate-max-tiles", type=int, default=None)
 
     return parser.parse_args()
 
@@ -742,29 +874,30 @@ def main():
     print(f"  Output dir : {args.output_dir}")
     print(f"  Resume     : {args.resume}")
     print(f"  Max px/tile: {args.max_pixels_per_tile or 'all'}")
+    print(f"  Workers    : {args.num_workers}")
 
     t0 = time.time()
 
-    # Load existing results if available
     all_results  = {}
     results_path = args.output_dir / RESULTS_JSON
     if results_path.exists():
         with open(results_path) as f:
             all_results = json.load(f)
 
-    # Skip refitting if only plotting/validating and results already exist
     skip_fit = (args.plot_sigmoid or args.validate_threshold) and \
                all(ds in all_results for ds in args.datasets)
 
     if not skip_fit:
         for dataset in args.datasets:
             result = run_dataset(
-                dataset    = dataset,
-                data_root  = args.data_root,
-                output_dir = args.output_dir,
-                resume     = args.resume,
-                max_pixels = args.max_pixels_per_tile,
-                n_examples = args.n_examples,
+                dataset     = dataset,
+                data_root   = args.data_root,
+                output_dir  = args.output_dir,
+                resume      = args.resume,
+                max_pixels  = args.max_pixels_per_tile,
+                n_examples  = args.n_examples,
+                num_workers   = args.num_workers,
+                max_fit_tiles = args.max_fit_tiles,
             )
             if result is not None:
                 all_results[dataset] = result
@@ -776,7 +909,7 @@ def main():
             json.dump(all_results, f, indent=2)
         print(f"\nResults saved: {results_path}")
 
-    # Sigmoid curve plots (always generated after fitting, or on demand)
+    # Sigmoid curve plots
     plot_targets = args.plot_datasets or args.datasets
     if args.plot_sigmoid or not skip_fit:
         for ds in plot_targets:
@@ -791,8 +924,6 @@ def main():
                     show_annotations = not args.sigmoid_no_annotations,
                     dpi              = args.sigmoid_dpi,
                 )
-            else:
-                print(f"  [WARN] No results for {ds} — run study first.")
 
     # Threshold validation
     if args.validate_threshold:
@@ -804,15 +935,15 @@ def main():
                    if args.threshold_override is not None
                    else all_results[ds]["global_Ith"])
             run_threshold_validation(
-                dataset    = ds,
-                data_root  = args.data_root,
-                output_dir = args.output_dir,
-                Ith        = Ith,
-                n_examples = args.n_examples,
-                max_tiles  = args.validate_max_tiles,
+                dataset     = ds,
+                data_root   = args.data_root,
+                output_dir  = args.output_dir,
+                Ith         = Ith,
+                n_examples  = args.n_examples,
+                max_tiles   = args.validate_max_tiles,
+                num_workers = args.num_workers,
             )
 
-    # Final summary
     print(f"\n{'='*60}")
     print(f"  FINAL SUMMARY")
     print(f"{'='*60}")
