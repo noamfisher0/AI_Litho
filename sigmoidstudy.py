@@ -257,6 +257,26 @@ def _validate_worker(args_tuple):
 
     return tile_id, metrics, aerial, printed
 
+def _consistency_worker(args_tuple):
+    tid, resist_path, printed_path = args_tuple
+    resist  = load_tile(Path(resist_path))
+    printed = load_tile(Path(printed_path))
+    if resist is None or printed is None:
+        return tid, None
+    if resist.shape != printed.shape:
+        return tid, None
+
+    resist_bin  = (resist  > 0.5).astype(np.float32)
+    printed_bin = (printed > 0.5).astype(np.float32)
+
+    mse = float(np.mean((resist_bin - printed_bin) ** 2))
+    tp  = int(np.sum((resist_bin == 1) & (printed_bin == 1)))
+    fp  = int(np.sum((resist_bin == 1) & (printed_bin == 0)))
+    fn  = int(np.sum((resist_bin == 0) & (printed_bin == 1)))
+    iou = tp / (tp + fp + fn + 1e-8)
+
+    return tid, {"mse": mse, "iou": iou, "tp": tp, "fp": fp, "fn": fn}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Visualisations — fitting
@@ -826,6 +846,68 @@ def run_threshold_validation(dataset: str, data_root: Path, output_dir: Path,
     plot_threshold_validation(df, example_data, dataset, Ith, output_dir)
 
 
+def run_gt_consistency_check(dataset: str, data_root: Path, output_dir: Path,
+                              alpha: float, Ith: float, num_workers: int = 4):
+    print(f"\n  GT Consistency Check — {dataset}")
+
+    pairs = find_tile_pairs(data_root, dataset, keys=["resist", "printed"])
+    if not pairs:
+        print("  [SKIP] No resist+printed pairs found.")
+        return
+
+    print(f"  Checking {len(pairs)} tiles...")
+
+    worker_args = [
+        (tid, str(paths["resist"]), str(paths["printed"]))
+        for tid, paths in pairs
+    ]
+
+    records = []
+
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_consistency_worker, arg): arg
+                       for arg in worker_args}
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc=f"GT check {dataset}", unit="tile",
+                               dynamic_ncols=True):
+                tid, metrics = future.result()
+                if metrics is not None:
+                    metrics["tile_id"] = tid
+                    records.append(metrics)
+    else:
+        for arg in tqdm(worker_args, desc=f"GT check {dataset}",
+                        unit="tile", dynamic_ncols=True):
+            tid, metrics = _consistency_worker(arg)
+            if metrics is not None:
+                metrics["tile_id"] = tid
+                records.append(metrics)
+
+    if not records:
+        print("  [WARN] No valid tiles.")
+        return
+
+    df = pd.DataFrame(records)
+    inconsistent = df[(df["mse"] > 0) | (df["iou"] < 1.0 - 1e-6)]
+
+    print(f"\n  GT Consistency Results:")
+    print(f"    Tiles checked      : {len(df)}")
+    print(f"    MSE  — mean: {df['mse'].mean():.2e}  max: {df['mse'].max():.2e}")
+    print(f"    IOU  — mean: {df['iou'].mean():.6f}  min: {df['iou'].min():.6f}")
+    print(f"    Inconsistent tiles : {len(inconsistent)} / {len(df)}")
+
+    if len(inconsistent) == 0:
+        print("    => PERFECT CONSISTENCY: resist GT thresholded at 0.5 "
+              "exactly reproduces printed GT for all tiles.")
+    else:
+        print(f"    => WARNING: {len(inconsistent)} tiles show discrepancy.")
+        print(inconsistent[["tile_id", "mse", "iou", "fp", "fn"]].to_string(index=False))
+
+    csv_out = output_dir / dataset / "gt_consistency.csv"
+    csv_out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_out, index=False)
+    print(f"  Saved: {csv_out}")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -861,6 +943,11 @@ def parse_args():
     parser.add_argument("--threshold-override", type=float, default=None)
     parser.add_argument("--validate-max-tiles", type=int, default=None)
 
+    parser.add_argument("--gt-consistency-check", action="store_true",
+                    help="Verify resist GT thresholded at 0.5 exactly reproduces printed GT")
+    parser.add_argument("--max-fit-tiles", type=int, default=None,
+                    help="Limit fitting to the first N tiles per dataset (default: all)")
+
     return parser.parse_args()
 
 
@@ -884,8 +971,8 @@ def main():
         with open(results_path) as f:
             all_results = json.load(f)
 
-    skip_fit = (args.plot_sigmoid or args.validate_threshold) and \
-               all(ds in all_results for ds in args.datasets)
+    skip_fit = (args.plot_sigmoid or args.validate_threshold or args.gt_consistency_check) and \
+           all(ds in all_results for ds in args.datasets)
 
     if not skip_fit:
         for dataset in args.datasets:
@@ -943,6 +1030,22 @@ def main():
                 max_tiles   = args.validate_max_tiles,
                 num_workers = args.num_workers,
             )
+
+
+    if args.gt_consistency_check:
+        for ds in args.datasets:
+            if ds not in all_results:
+                print(f"  [WARN] No fitted results for {ds}. Run study first.")
+                continue
+            run_gt_consistency_check(
+                dataset     = ds,
+                data_root   = args.data_root,
+                output_dir  = args.output_dir,
+                alpha       = all_results[ds]["global_alpha"],
+                Ith         = all_results[ds]["global_Ith"],
+                num_workers = args.num_workers,
+            )
+
 
     print(f"\n{'='*60}")
     print(f"  FINAL SUMMARY")
