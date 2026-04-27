@@ -703,6 +703,7 @@ def plot_density_histograms(
     resolution:    int,
     output_dir:    Path,
     bins:          int  = 40,
+    samples:       int  = None,
     datasets:      list = None,
     datatypes:     list = None,
     save:          bool = False,
@@ -711,6 +712,8 @@ def plot_density_histograms(
     One figure per datatype; one subplot per dataset.
     Shows the distribution of pixel densities at the given downsampled resolution,
     with mean and ±1σ marked as vertical lines.
+
+    samples: if set, randomly draw at most this many values per (dataset, datatype).
     """
     ds_filter = {d.lower() for d in datasets}  if datasets  else None
     dt_filter = {d.lower() for d in datatypes} if datatypes else None
@@ -732,6 +735,12 @@ def plot_density_histograms(
             if dt_filter and dt.lower() not in dt_filter:
                 continue
             records.setdefault((ds, dt), []).append(fv)
+
+    if samples is not None:
+        records = {
+            k: random.sample(v, min(samples, len(v)))
+            for k, v in records.items()
+        }
 
     if not records:
         print(f"No data found for resolution={resolution}. "
@@ -888,6 +897,7 @@ def main():
         plot_density_histograms(
             per_image_csv, args.hist_resolution, OUTPUT_DIR,
             bins=args.bins,
+            samples=args.samples,
             datasets=args.datasets, datatypes=args.datatypes,
             save=args.save_plots,
         )
