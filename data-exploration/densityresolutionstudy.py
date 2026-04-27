@@ -537,6 +537,15 @@ def print_tables(averaged_csv: Path):
 # Plotting
 # ------------------------------------------------------------------------------
 
+DATASET_COLORS = {
+    "MetalSet":   "#2E86AB",
+    "ViaSet":     "#E07B39",
+    "StdContact": "#6A994E",
+    "StdMetal":   "#9B5DE5",
+}
+DATASET_ORDER  = ["MetalSet", "ViaSet", "StdMetal", "StdContact"]
+DEFAULT_COLOR  = "#888888"
+
 _COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c",
     "#d62728", "#9467bd", "#8c564b",
@@ -689,6 +698,102 @@ def plot_density_ratio_vs_resolution(
     plt.close(fig)
 
 
+def plot_density_histograms(
+    per_image_csv: Path,
+    resolution:    int,
+    output_dir:    Path,
+    bins:          int  = 40,
+    datasets:      list = None,
+    datatypes:     list = None,
+    save:          bool = False,
+):
+    """
+    One figure per datatype; one subplot per dataset.
+    Shows the distribution of pixel densities at the given downsampled resolution,
+    with mean and ±1σ marked as vertical lines.
+    """
+    ds_filter = {d.lower() for d in datasets}  if datasets  else None
+    dt_filter = {d.lower() for d in datatypes} if datatypes else None
+
+    records = {}   # (dataset, datatype) → list of density floats
+    with open(per_image_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if int(row["resolution"]) != resolution:
+                continue
+            v = row.get("density", "")
+            if v == "":
+                continue
+            fv = float(v)
+            if math.isnan(fv) or math.isinf(fv):
+                continue
+            ds, dt = row["dataset"], row["datatype"]
+            if ds_filter and ds.lower() not in ds_filter:
+                continue
+            if dt_filter and dt.lower() not in dt_filter:
+                continue
+            records.setdefault((ds, dt), []).append(fv)
+
+    if not records:
+        print(f"No data found for resolution={resolution}. "
+              "Check --hist-resolution and that --evaluate has been run.")
+        return
+
+    all_datatypes = [dt for dt in DATATYPE_ORDER if any(dt == k[1] for k in records)]
+    all_datatypes += sorted(
+        dt for dt in set(k[1] for k in records) if dt not in DATATYPE_ORDER
+    )
+
+    known_ds   = [ds for ds in DATASET_ORDER if any(ds == k[0] for k in records)]
+    unknown_ds = sorted(ds for ds in set(k[0] for k in records) if ds not in DATASET_ORDER)
+    all_datasets = known_ds + unknown_ds
+
+    for datatype in all_datatypes:
+        active = [ds for ds in all_datasets if (ds, datatype) in records]
+        if not active:
+            continue
+
+        n_cols = len(active)
+        fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4),
+                                 constrained_layout=False)
+        fig.subplots_adjust(top=0.88, bottom=0.12, left=0.07, right=0.97, wspace=0.35)
+        if n_cols == 1:
+            axes = [axes]
+
+        for ax, dataset in zip(axes, active):
+            vals  = records[(dataset, datatype)]
+            color = DATASET_COLORS.get(dataset, DEFAULT_COLOR)
+            mean  = float(np.mean(vals))
+            std   = float(np.std(vals))
+
+            ax.hist(vals, bins=bins, color=color, alpha=0.75, edgecolor="white")
+            ax.axvline(mean,       color="#222222", linewidth=1.8,
+                       linestyle="-",  label=f"Mean {mean:.4f}")
+            ax.axvline(mean - std, color="#222222", linewidth=1.2,
+                       linestyle="--", label=f"±1σ  {std:.4f}")
+            ax.axvline(mean + std, color="#222222", linewidth=1.2,
+                       linestyle="--")
+
+            ax.set_title(f"{dataset}\nn={len(vals):,}", fontsize=13, fontweight="bold")
+            ax.set_xlabel("Pixel Density", fontsize=12)
+            ax.set_ylabel("Count", fontsize=12)
+            ax.tick_params(axis="both", labelsize=11)
+            ax.legend(fontsize=10, framealpha=0.85)
+            ax.grid(True, alpha=0.2, linestyle="--")
+
+        fig.suptitle(
+            f"Datatype: {datatype}  —  resolution: {resolution}px (average downsampling)",
+            fontsize=14, fontweight="bold", y=0.97,
+        )
+
+        if save:
+            out = output_dir / f"density_hist_{datatype}_{resolution}px.png"
+            fig.savefig(out, dpi=150, bbox_inches="tight")
+            print(f"  Saved: {out}")
+        else:
+            plt.show()
+        plt.close(fig)
+
+
 # ------------------------------------------------------------------------------
 # Argument parser + main
 # ------------------------------------------------------------------------------
@@ -698,20 +803,25 @@ def parse_args():
         description="Pixel density under average downsampling — LithoBench.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--evaluate",     action="store_true", help="run parallel evaluation")
-    p.add_argument("--aggregate",    action="store_true", help="re-aggregate per-image CSV")
-    p.add_argument("--plot",         action="store_true", help="plot density vs resolution")
-    p.add_argument("--plot-ratio",   action="store_true", help="plot density ratio vs resolution")
-    p.add_argument("--tables",       action="store_true", help="print tables to terminal")
-    p.add_argument("--workers",      type=int,   default=None,  metavar="N")
-    p.add_argument("--batch-size",   type=int,   default=32,    metavar="N")
-    p.add_argument("--samples",      type=int,   default=None,  metavar="N")
-    p.add_argument("--resolutions",  type=int,   nargs="+",     default=TARGET_RESOLUTIONS, metavar="N")
-    p.add_argument("--datasets",     type=str,   nargs="+",     default=None, metavar="D")
-    p.add_argument("--datatypes",    type=str,   nargs="+",     default=None, metavar="T")
-    p.add_argument("--force",        action="store_true")
-    p.add_argument("--save-plots",   action="store_true")
-    p.add_argument("--timeout",      type=int,   default=60,    metavar="N")
+    p.add_argument("--evaluate",        action="store_true", help="run parallel evaluation")
+    p.add_argument("--aggregate",       action="store_true", help="re-aggregate per-image CSV")
+    p.add_argument("--plot",            action="store_true", help="plot density vs resolution")
+    p.add_argument("--plot-ratio",      action="store_true", help="plot density ratio vs resolution")
+    p.add_argument("--plot-hist",       action="store_true", help="plot density histograms at a specific resolution")
+    p.add_argument("--hist-resolution", type=int, default=None, metavar="N",
+                   help="resolution to use for --plot-hist (e.g. 512)")
+    p.add_argument("--bins",            type=int, default=40, metavar="N",
+                   help="number of histogram bins (default: 40)")
+    p.add_argument("--tables",          action="store_true", help="print tables to terminal")
+    p.add_argument("--workers",         type=int,   default=None,  metavar="N")
+    p.add_argument("--batch-size",      type=int,   default=32,    metavar="N")
+    p.add_argument("--samples",         type=int,   default=None,  metavar="N")
+    p.add_argument("--resolutions",     type=int,   nargs="+",     default=TARGET_RESOLUTIONS, metavar="N")
+    p.add_argument("--datasets",        type=str,   nargs="+",     default=None, metavar="D")
+    p.add_argument("--datatypes",       type=str,   nargs="+",     default=None, metavar="T")
+    p.add_argument("--force",           action="store_true")
+    p.add_argument("--save-plots",      action="store_true")
+    p.add_argument("--timeout",         type=int,   default=60,    metavar="N")
     return p.parse_args()
 
 
@@ -768,7 +878,21 @@ def main():
             save=args.save_plots,
         )
 
-    if not any([args.evaluate, args.aggregate, args.tables, args.plot, args.plot_ratio]):
+    if args.plot_hist:
+        if not per_image_csv.exists():
+            print(f"ERROR: {per_image_csv} not found — run --evaluate first.")
+            sys.exit(1)
+        if args.hist_resolution is None:
+            print("ERROR: --plot-hist requires --hist-resolution N (e.g. --hist-resolution 512).")
+            sys.exit(1)
+        plot_density_histograms(
+            per_image_csv, args.hist_resolution, OUTPUT_DIR,
+            bins=args.bins,
+            datasets=args.datasets, datatypes=args.datatypes,
+            save=args.save_plots,
+        )
+
+    if not any([args.evaluate, args.aggregate, args.tables, args.plot, args.plot_ratio, args.plot_hist]):
         print("No action specified. Use --help to see available flags.")
 
 
