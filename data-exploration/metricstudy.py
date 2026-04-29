@@ -89,6 +89,26 @@ Flags
                             (default: 0.5 = physical I_th post-sigmoid; no effect on
                             the already-binary Printed datatype)
 
+IOU study (LithoBench-style, ground-truth vs Target)
+-----------------------------------------------------
+  --iou                   run the IOU evaluation (ground-truth Printed or Resist vs Target)
+  --iou-candidates A B    which ground-truth datatypes to compare against Target
+                            choices: Printed, Resist (default: both)
+                            e.g. --iou-candidates Printed
+                                 --iou-candidates Resist
+                                 --iou-candidates Printed Resist
+  --iou-threshold F       binarisation threshold applied to both the candidate and
+                            Target before computing IOU (default: 0.5).
+                            For Printed this has no effect (already binary).
+                            For Resist, 0.5 corresponds to the physical I_th.
+  --plot-iou              generate IOU histograms from iou_per_image.csv
+  --plot-iou-mean-std     generate IOU mean±std comparison plots
+  --tables-iou            print per-subset IOU mean/std tables to terminal
+
+  Output CSVs:
+    iou_per_image.csv     one row per image pair with its IOU score
+    iou_averaged.csv      one row per subset with mean and std deviation
+
 Usage examples
 --------------
   python metricstudy.py --evaluate
@@ -102,6 +122,11 @@ Usage examples
   python metricstudy.py --evaluate --candidates Printed
   python metricstudy.py --evaluate --candidates Resist
   python metricstudy.py --evaluate --force --workers 8
+  python metricstudy.py --iou
+  python metricstudy.py --iou --iou-candidates Printed
+  python metricstudy.py --iou --iou-candidates Resist
+  python metricstudy.py --iou --plot-iou --plot-iou-mean-std --save-plots
+  python metricstudy.py --iou --tables-iou --save-plots
 """
 
 import argparse
@@ -184,6 +209,17 @@ AVERAGED_FIELDS = [
     "num_samples",
     "mean_l2_sq",  "std_l2_sq",
     "mean_epe",    "std_epe",
+]
+
+# IOU study schemas (LithoBench-style: ground-truth Z vs Target T)
+IOU_PER_IMAGE_FIELDS = [
+    "subset", "dataset", "datatype", "filename", "iou",
+]
+
+IOU_AVERAGED_FIELDS = [
+    "subset", "dataset", "datatype",
+    "num_samples",
+    "mean_iou", "std_iou",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1126,6 +1162,525 @@ def plot_mean_std(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# IOU study  (LithoBench-style: ground-truth Printed or Resist vs Target)
+# ──────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_IOU_THRESHOLD = 0.5   # binarisation threshold for both candidate and target
+
+
+def compute_iou(candidate: np.ndarray, target: np.ndarray,
+                threshold: float = DEFAULT_IOU_THRESHOLD) -> float:
+    """
+    LithoBench-style IOU between a ground-truth candidate Z and target T.
+
+        IOU(Z, T) = |Z¹ ∩ T¹| / |Z¹ ∪ T¹|
+
+    where Z¹ and T¹ are the foreground (value=1) regions after binarisation.
+    Both inputs are float32 in [0, 1].  threshold=0.5 is the physical I_th:
+      - For Printed (already hard binary) it has no practical effect.
+      - For Resist (sigmoid output) it corresponds to the contour where
+        σ(α(I − I_th)) = 0.5, i.e. the same contour as I = I_th for Printed.
+
+    Returns NaN when both Z¹ and T¹ are empty (no foreground pixels).
+    """
+    z_bin = candidate >= threshold
+    t_bin = target    >= threshold
+    intersection = float(np.logical_and(z_bin, t_bin).sum())
+    union        = float(np.logical_or( z_bin, t_bin).sum())
+    if union == 0.0:
+        return float("nan")
+    return intersection / union
+
+
+def _process_iou_pair(task: tuple):
+    """
+    Worker function: compute IOU for a single (candidate, target) image pair.
+
+    task: (subset, dataset, datatype, filename,
+           cand_path_str, tgt_path_str, iou_threshold, log_file)
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+
+    (subset, dataset, datatype, filename,
+     cand_path_str, tgt_path_str, iou_threshold, log_file) = task
+
+    logger = setup_logging(Path(log_file))
+    logger.debug(f"IOU {subset}/{filename}")
+
+    cand = load_image_gray(Path(cand_path_str))
+    tgt  = load_image_gray(Path(tgt_path_str))
+
+    if cand is None or tgt is None:
+        logger.warning(f"IOU: failed to load {subset}/{filename} — skipping")
+        return None
+
+    if cand.shape != tgt.shape:
+        cand = cv2.resize(cand, (tgt.shape[1], tgt.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+
+    try:
+        iou_val = compute_iou(cand, tgt, threshold=iou_threshold)
+        logger.debug(f"IOU DONE {subset}/{filename}  IOU={iou_val:.4f}")
+        return {
+            "subset":   subset,
+            "dataset":  dataset,
+            "datatype": datatype,
+            "filename": filename,
+            "iou":      round(iou_val, 6) if not math.isnan(iou_val) else "",
+        }
+    except Exception as exc:
+        logger.warning(f"IOU ERROR {subset}/{filename}: {exc}")
+        return None
+
+
+def _process_iou_batch(batch_tasks: list):
+    rows, failed = [], 0
+    for task in batch_tasks:
+        row = _process_iou_pair(task)
+        if row is None:
+            failed += 1
+        else:
+            rows.append(row)
+    return rows, failed
+
+
+def _append_iou_rows(csv_path: Path, rows: list):
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=IOU_PER_IMAGE_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def _load_iou_completed(csv_path: Path) -> set:
+    done = set()
+    if not csv_path.exists():
+        return done
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                done.add((row["subset"], row["filename"]))
+    except Exception:
+        pass
+    return done
+
+
+def aggregate_iou_csv(per_image_csv: Path, averaged_csv: Path):
+    """Read iou_per_image.csv and compute mean + std per subset."""
+    records: dict = {}
+    with open(per_image_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            val = row.get("iou", "")
+            if val == "":
+                continue
+            try:
+                fval = float(val)
+            except ValueError:
+                continue
+            if math.isnan(fval) or math.isinf(fval):
+                continue
+            s = row["subset"]
+            if s not in records:
+                records[s] = {
+                    "dataset":  row["dataset"],
+                    "datatype": row["datatype"],
+                    "vals": [],
+                }
+            records[s]["vals"].append(fval)
+
+    with open(averaged_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=IOU_AVERAGED_FIELDS)
+        w.writeheader()
+        for subset in sorted(records.keys()):
+            r    = records[subset]
+            vals = np.array(r["vals"])
+            w.writerow({
+                "subset":      subset,
+                "dataset":     r["dataset"],
+                "datatype":    r["datatype"],
+                "num_samples": len(vals),
+                "mean_iou":    round(float(np.mean(vals)), 6),
+                "std_iou":     round(float(np.std(vals)),  6),
+            })
+    return averaged_csv
+
+
+def run_iou_evaluation(
+    data_dict:     dict,
+    output_dir:    Path,
+    num_workers:   int   = None,
+    num_samples:   int   = None,
+    batch_size:    int   = 16,
+    force:         bool  = False,
+    timeout:       int   = 120,
+    iou_candidates: list = None,   # ["printed"], ["resist"], or both
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+):
+    """
+    Evaluate LithoBench-style IOU(Z_gt, T) for Printed and/or Resist vs Target.
+    Results are written to iou_per_image.csv and iou_averaged.csv — separate
+    from the L2²/EPE CSVs so both studies can coexist in the same output dir.
+    """
+    import tqdm
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    per_image_csv = output_dir / "iou_per_image.csv"
+    averaged_csv  = output_dir / "iou_averaged.csv"
+    logger        = get_logger()
+
+    if force:
+        for p in (per_image_csv, averaged_csv):
+            if p.exists():
+                p.unlink()
+        logger.info("--force: cleared existing IOU CSVs")
+        print("--force: cleared existing IOU results, starting fresh.\n")
+
+    completed = _load_iou_completed(per_image_csv)
+    logger.info(f"IOU already completed: {len(completed)} pairs")
+
+    active = [c.lower() for c in iou_candidates] if iou_candidates else ["printed", "resist"]
+
+    # Build nested lookup: dataset → {datatype_lower → dir_path}
+    nested: dict = {}
+    for key, path in data_dict.items():
+        ds, dt = key.rsplit("-", 1)
+        nested.setdefault(ds, {})[dt.lower()] = Path(path)
+
+    print("Scanning dataset directories for IOU study ...")
+    tasks = []
+
+    for dataset, dt_map in nested.items():
+        tgt_dir = dt_map.get("target")
+        if tgt_dir is None or not tgt_dir.exists():
+            logger.info(f"No 'target' dir for {dataset}, skipping IOU.")
+            continue
+
+        for datatype in active:
+            cand_dir = dt_map.get(datatype)
+            if cand_dir is None or not cand_dir.exists():
+                logger.info(f"No '{datatype}' dir for {dataset}, skipping IOU.")
+                continue
+
+            cand_files = {f.name: f for f in sorted(cand_dir.iterdir()) if f.is_file()}
+            tgt_files  = {f.name: f for f in sorted(tgt_dir.iterdir())  if f.is_file()}
+            common     = sorted(set(cand_files) & set(tgt_files))
+
+            if not common:
+                logger.info(f"No overlapping filenames for IOU {dataset}/{datatype}, skipping.")
+                continue
+
+            if num_samples is not None:
+                common = random.sample(common, min(num_samples, len(common)))
+
+            subset = f"{dataset}-{datatype.capitalize()}"
+
+            for fname in common:
+                if (subset, fname) in completed:
+                    continue
+                tasks.append((
+                    subset,
+                    dataset,
+                    datatype.capitalize(),
+                    fname,
+                    str(cand_files[fname]),
+                    str(tgt_files[fname]),
+                    iou_threshold,
+                    str(LOG_FILE),
+                ))
+
+    pending = len(tasks)
+
+    if completed:
+        print(f"\nResuming IOU — {len(completed)} pairs done, {pending} remaining.\n")
+    else:
+        print(f"\nIOU: {pending} image pairs to process.\n")
+
+    if not pending:
+        if completed:
+            print("Nothing to do — all IOU pairs already processed.")
+            aggregate_iou_csv(per_image_csv, averaged_csv)
+            print(f"iou_averaged.csv written to: {averaged_csv}")
+        else:
+            print("No IOU image pairs found. Check data directories.")
+            logger.warning("No IOU pairs found and no prior results.")
+        return per_image_csv, averaged_csv
+
+    if num_workers is None:
+        num_workers = max(1, os.cpu_count() - 1)
+    num_workers = min(num_workers, pending)
+    batch_size  = max(1, int(batch_size))
+
+    batched_tasks = [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
+
+    logger.info(
+        f"IOU evaluation | pairs={pending} | workers={num_workers} | "
+        f"candidates={active} | threshold={iou_threshold}"
+    )
+    print(
+        f"Workers: {num_workers}  |  Pairs: {pending}  |  "
+        f"Batch size: {batch_size} ({len(batched_tasks)} batches)\n"
+    )
+
+    failed = timedout = 0
+
+    with cf.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_batch = {
+            executor.submit(_process_iou_batch, batch): batch
+            for batch in batched_tasks
+        }
+        with tqdm.tqdm(
+            total=pending, desc="Computing IOU", unit="pair",
+            dynamic_ncols=True, file=sys.stdout,
+        ) as pbar:
+            for future in cf.as_completed(future_to_batch):
+                batch        = future_to_batch[future]
+                first_subset = batch[0][0]
+                first_file   = batch[0][3]
+                batch_timeout = max(timeout, timeout * len(batch))
+                try:
+                    rows, batch_failed = future.result(timeout=batch_timeout)
+                    if rows:
+                        _append_iou_rows(per_image_csv, rows)
+                    failed += batch_failed
+                except cf.TimeoutError:
+                    timedout += len(batch)
+                    logger.error(
+                        f"IOU TIMEOUT ({batch_timeout}s) batch "
+                        f"{first_subset}/{first_file} — skipped {len(batch)} pairs"
+                    )
+                except Exception as exc:
+                    failed += len(batch)
+                    logger.error(f"IOU ERROR batch {first_subset}/{first_file}: {exc}")
+                pbar.update(len(batch))
+
+    issues = failed + timedout
+    if issues:
+        print(f"\n  {failed} failed, {timedout} timed out. See {LOG_FILE} for details.")
+    else:
+        print("\n  All IOU pairs processed successfully.")
+
+    print("\nAggregating IOU results ...")
+    aggregate_iou_csv(per_image_csv, averaged_csv)
+    logger.info(f"IOU aggregation complete: {averaged_csv}")
+    print(f"  iou_per_image.csv : {per_image_csv}")
+    print(f"  iou_averaged.csv  : {averaged_csv}")
+
+    return per_image_csv, averaged_csv
+
+
+def print_iou_tables(averaged_csv: Path):
+    """Print mean and std IOU per subset, grouped by dataset."""
+    rows = []
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        print("No IOU averaged rows found.")
+        return
+
+    groups: dict = {}
+    for row in rows:
+        groups.setdefault(row["dataset"], []).append(row)
+
+    cw = {"dt": 10, "n": 7, "mean": 12, "std": 12}
+    header = (
+        f"{'Datatype':<{cw['dt']}}"
+        f"  {'N':>{cw['n']}}"
+        f"  {'Mean IOU':>{cw['mean']}}"
+        f"  {'Std IOU':>{cw['std']}}"
+    )
+    width = len(header)
+
+    for dataset in [d for d in ["MetalSet", "ViaSet", "StdMetal", "StdContact"]
+                    if d in groups] + \
+                   [d for d in sorted(groups) if d not in
+                    ["MetalSet", "ViaSet", "StdMetal", "StdContact"]]:
+        dataset_rows = groups[dataset]
+        print(f"\n{'=' * width}")
+        print(f"  {dataset}")
+        print(f"{'=' * width}")
+        print(header)
+        print("-" * width)
+        for row in sorted(dataset_rows, key=lambda r: r["datatype"]):
+            print(
+                f"{row['datatype']:<{cw['dt']}}"
+                f"  {row['num_samples']:>{cw['n']}}"
+                f"  {float(row['mean_iou']):>{cw['mean']}.4f}"
+                f"  {float(row['std_iou']):>{cw['std']}.4f}"
+            )
+        print("-" * width)
+
+
+def plot_iou_histograms(
+    per_image_csv: str,
+    bins:          int  = 40,
+    save_dir:      str  = None,
+    dt_filter:     set  = None,
+    ds_filter:     set  = None,
+):
+    """
+    One figure per datatype (Printed / Resist), one subplot per dataset.
+    Mean and ±1σ marked as vertical lines — mirrors plot_metric_histograms style.
+    """
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    records: dict = {}   # (dataset, datatype) → [float]
+
+    with open(per_image_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            val = row.get("iou", "")
+            if val == "":
+                continue
+            try:
+                fval = float(val)
+            except ValueError:
+                continue
+            if math.isnan(fval) or math.isinf(fval):
+                continue
+            key = (row["dataset"], row["datatype"])
+            records.setdefault(key, []).append(fval)
+
+    datatypes = _apply_datatype_filter(
+        sorted({dt for _, dt in records.keys()}), dt_filter)
+    datasets  = _apply_dataset_filter_and_order(
+        list({ds for ds, _ in records.keys()}), ds_filter)
+
+    for datatype in datatypes:
+        active = [ds for ds in datasets if (ds, datatype) in records]
+        if not active:
+            continue
+
+        n_cols = len(active)
+        fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4),
+                                 constrained_layout=False)
+        fig.subplots_adjust(top=0.88, bottom=0.12,
+                            left=0.07, right=0.97, wspace=0.35)
+        if n_cols == 1:
+            axes = [axes]
+
+        for ax, dataset in zip(axes, active):
+            vals  = records[(dataset, datatype)]
+            color = DATASET_COLORS.get(dataset, DEFAULT_COLOR)
+            n     = len(vals)
+            mean  = float(np.mean(vals))
+            std   = float(np.std(vals))
+
+            ax.hist(vals, bins=bins, color=color, alpha=0.75, edgecolor="white",
+                    range=(0.0, 1.0))
+            ax.axvline(mean,       color="#222222", linewidth=1.8,
+                       linestyle="-",  label=f"Mean {mean:.4f}")
+            ax.axvline(mean - std, color="#222222", linewidth=1.2,
+                       linestyle="--", label=f"±1σ  {std:.4f}")
+            ax.axvline(mean + std, color="#222222", linewidth=1.2,
+                       linestyle="--")
+
+            ax.set_xlim(0.0, 1.0)
+            ax.set_title(f"{dataset}\nn={n:,}", fontsize=13, fontweight="bold")
+            ax.set_xlabel("IOU (Z_gt vs Target)", fontsize=12)
+            ax.set_ylabel("Count", fontsize=12)
+            ax.tick_params(axis="both", labelsize=11)
+            ax.legend(fontsize=10, framealpha=0.85)
+            ax.grid(True, alpha=0.2, linestyle="--")
+
+        fig.suptitle(
+            f"IOU (ground-truth vs Target) — Datatype: {datatype}",
+            fontsize=15, fontweight="bold", y=0.97,
+        )
+
+        if save_dir is not None:
+            out = save_dir / f"hist_IOU_{datatype}.png"
+            plt.savefig(out, dpi=150, bbox_inches="tight")
+            print(f"  Saved: {out}")
+
+        plt.show()
+        plt.close(fig)
+
+
+def plot_iou_mean_std(
+    averaged_csv: str,
+    save_dir:     str = None,
+    dt_filter:    set = None,
+    ds_filter:    set = None,
+):
+    """
+    One subplot per datatype showing IOU mean±std across datasets.
+    Mirrors plot_mean_std style.
+    """
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    records = []
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            records.append({
+                "subset":   row["subset"],
+                "dataset":  row["dataset"],
+                "datatype": row["datatype"],
+                "mean_iou": float(row["mean_iou"]),
+                "std_iou":  float(row["std_iou"]),
+                "n":        int(row["num_samples"]),
+            })
+
+    if not records:
+        print("No IOU averaged rows available to plot.")
+        return
+
+    datatypes = _apply_datatype_filter(
+        sorted({r["datatype"] for r in records}), dt_filter)
+
+    for datatype in datatypes:
+        rows = [r for r in records if r["datatype"] == datatype]
+        if not rows:
+            continue
+
+        present_datasets = _apply_dataset_filter_and_order(
+            [r["dataset"] for r in rows], ds_filter)
+        rows = [r for r in rows if r["dataset"] in present_datasets]
+        rows.sort(key=lambda r: present_datasets.index(r["dataset"]))
+        if not rows:
+            continue
+
+        fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+        fig.suptitle(f"IOU (ground-truth vs Target) — Datatype: {datatype}",
+                     fontsize=14, fontweight="bold")
+        x = np.arange(len(rows))
+
+        for i, row in enumerate(rows):
+            color = DATASET_COLORS.get(row["dataset"], DEFAULT_COLOR)
+            ax.errorbar(
+                x[i], row["mean_iou"], yerr=row["std_iou"],
+                fmt="o", color=color, ecolor=color,
+                elinewidth=2, capsize=6, markersize=8, label=row["dataset"],
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([r["dataset"] for r in rows], rotation=25,
+                           ha="right", fontsize=13)
+        ax.set_ylabel("Mean IOU (Z_gt vs Target)", fontsize=13)
+        ax.set_xlabel("Dataset", fontsize=13)
+        ax.set_title("IOU mean ± 1σ", fontsize=13, fontweight="bold")
+        ax.set_ylim(0.0, 1.05)
+        ax.tick_params(axis="y", labelsize=12)
+        ax.grid(True, axis="y", alpha=0.25, linestyle="--")
+        ax.margins(x=0.12)
+
+        plt.tight_layout()
+
+        if save_dir is not None:
+            out = Path(save_dir) / f"iou_mean_std_{datatype}.png"
+            plt.savefig(out, dpi=150, bbox_inches="tight")
+            print(f"  Saved: {out}")
+
+        plt.show()
+        plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1185,12 +1740,37 @@ def parse_args():
                         f"EPE computation (default: {DEFAULT_EPE_BIN_THRESHOLD}). "
                         f"Corresponds to sigmoid midpoint / physical I_th. "
                         f"Has no effect on the already-binary Printed datatype.")
+
+    # ── IOU study flags ───────────────────────────────────────────────────────
+    p.add_argument("--iou",             action="store_true",
+                   help="Run the LithoBench-style IOU evaluation "
+                        "(ground-truth Printed or Resist vs Target).")
+    p.add_argument("--iou-candidates",  nargs="+", default=None, metavar="CANDIDATE",
+                   help="Ground-truth datatypes to compare against Target for IOU. "
+                        "Choices: Printed, Resist (default: both). "
+                        "E.g. --iou-candidates Printed  or  --iou-candidates Printed Resist")
+    p.add_argument("--iou-threshold",   type=float, default=DEFAULT_IOU_THRESHOLD,
+                   help=f"Binarisation threshold applied to both the candidate and "
+                        f"Target before IOU (default: {DEFAULT_IOU_THRESHOLD}). "
+                        f"0.5 = physical I_th / sigmoid midpoint.")
+    p.add_argument("--plot-iou",        action="store_true",
+                   help="Generate IOU histograms from iou_per_image.csv.")
+    p.add_argument("--plot-iou-mean-std", action="store_true",
+                   help="Generate IOU mean±std comparison plots from iou_averaged.csv.")
+    p.add_argument("--tables-iou",      action="store_true",
+                   help="Print per-subset IOU mean/std tables to terminal.")
+
     args = p.parse_args()
     if args.candidates:
         valid = {"printed", "resist", "litho"}   # add "litho"
         bad = [c for c in args.candidates if c.lower() not in valid]
         if bad:
             p.error(f"--candidates: invalid choice(s): {bad}. Choose from Printed, Resist, Litho.")
+    if args.iou_candidates:
+        valid_iou = {"printed", "resist"}
+        bad_iou = [c for c in args.iou_candidates if c.lower() not in valid_iou]
+        if bad_iou:
+            p.error(f"--iou-candidates: invalid choice(s): {bad_iou}. Choose from Printed, Resist.")
     return args
 
 
@@ -1205,9 +1785,11 @@ if __name__ == "__main__":
     args = parse_args()
 
     if not any([args.evaluate, args.aggregate, args.plot,
-                args.plot_mean_std, args.tables]):
+                args.plot_mean_std, args.tables,
+                args.iou, args.plot_iou, args.plot_iou_mean_std, args.tables_iou]):
         print("No action specified. Use --evaluate, --aggregate, --plot, "
-              "--plot-mean-std, or --tables.")
+              "--plot-mean-std, --tables, --iou, --plot-iou, "
+              "--plot-iou-mean-std, or --tables-iou.")
         print("Run with --help for full usage.")
         sys.exit(0)
 
@@ -1234,7 +1816,9 @@ if __name__ == "__main__":
         f"force={args.force} | candidates={args.candidates} | "
         f"datatypes={args.datatypes} | datasets={args.datasets} | "
         f"epe_spacing={args.epe_spacing} | epe_threshold={args.epe_threshold} | "
-        f"epe_bin_threshold={args.epe_bin_threshold}"
+        f"epe_bin_threshold={args.epe_bin_threshold} | "
+        f"iou={args.iou} | iou_candidates={args.iou_candidates} | "
+        f"iou_threshold={args.iou_threshold}"
     )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
@@ -1297,6 +1881,59 @@ if __name__ == "__main__":
             save_dir = str(OUTPUT_DIR) if args.save_plots else None
             plot_mean_std(
                 str(averaged_csv),
+                save_dir  = save_dir,
+                dt_filter = dt_filter,
+                ds_filter = ds_filter,
+            )
+
+    # ── IOU evaluation ────────────────────────────────────────────────────────
+    iou_per_image_csv = OUTPUT_DIR / "iou_per_image.csv"
+    iou_averaged_csv  = OUTPUT_DIR / "iou_averaged.csv"
+
+    if args.iou:
+        iou_per_image_csv, iou_averaged_csv = run_iou_evaluation(
+            data_dict      = DATA_DICT,
+            output_dir     = OUTPUT_DIR,
+            num_workers    = args.workers,
+            num_samples    = args.samples,
+            batch_size     = args.batch_size,
+            force          = args.force,
+            timeout        = args.timeout,
+            iou_candidates = args.iou_candidates,
+            iou_threshold  = args.iou_threshold,
+        )
+
+    # ── IOU terminal tables ───────────────────────────────────────────────────
+    if args.tables_iou:
+        if not iou_averaged_csv.exists():
+            print("iou_averaged.csv not found. Run --iou first.")
+        else:
+            print_iou_tables(iou_averaged_csv)
+
+    # ── IOU histograms ────────────────────────────────────────────────────────
+    if args.plot_iou:
+        if not iou_per_image_csv.exists():
+            print("iou_per_image.csv not found. Run --iou first.")
+        else:
+            print("\nGenerating IOU histograms ...")
+            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            plot_iou_histograms(
+                str(iou_per_image_csv),
+                bins      = args.bins,
+                save_dir  = save_dir,
+                dt_filter = dt_filter,
+                ds_filter = ds_filter,
+            )
+
+    # ── IOU mean / std plots ──────────────────────────────────────────────────
+    if args.plot_iou_mean_std:
+        if not iou_averaged_csv.exists():
+            print("iou_averaged.csv not found. Run --iou or --iou + --aggregate first.")
+        else:
+            print("\nGenerating IOU mean±std plots ...")
+            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            plot_iou_mean_std(
+                str(iou_averaged_csv),
                 save_dir  = save_dir,
                 dt_filter = dt_filter,
                 ds_filter = ds_filter,
