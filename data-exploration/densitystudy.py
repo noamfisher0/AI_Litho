@@ -596,6 +596,15 @@ def _apply_datatype_filter(datatypes: list, dt_filter) -> list:
 # Plotting  (reads from density_per_image.csv)
 # ──────────────────────────────────────────────────────────────────────────────
 
+HISTOGRAM_DATATYPE_TITLES = {
+    "PixelILT": "Optimized Mask",
+    "Litho": "Aerial",
+}
+
+
+def _histogram_datatype_title(datatype: str) -> str:
+    return HISTOGRAM_DATATYPE_TITLES.get(datatype, datatype)
+
 def plot_density_histograms(
     per_image_csv: str,
     bins:          int  = 40,
@@ -645,10 +654,10 @@ def plot_density_histograms(
 
         n_cols = len(active)
         fig, axes = plt.subplots(
-            1, n_cols, figsize=(5 * n_cols, 4),
+            1, n_cols, figsize=(5.5 * n_cols, 4.8),
             constrained_layout=False,
         )
-        fig.subplots_adjust(top=0.88, bottom=0.12,
+        fig.subplots_adjust(top=0.84, bottom=0.28,
                             left=0.07, right=0.97, wspace=0.35)
 
         if n_cols == 1:
@@ -657,30 +666,38 @@ def plot_density_histograms(
         for ax, dataset in zip(axes, active):
             vals  = records[(dataset, datatype)]
             color = DATASET_COLORS.get(dataset, DEFAULT_COLOR)
-            n     = len(vals)
             mean  = float(np.mean(vals))
             std   = float(np.std(vals))
 
             ax.hist(vals, bins=bins, color=color, alpha=0.75, edgecolor="white")
 
-            # Mean and ±1 std vertical lines
+            # Mean and +/- sigma vertical lines
             ax.axvline(mean,       color="#222222", linewidth=1.8,
                        linestyle="-",  label=f"Mean {mean:.4f}")
             ax.axvline(mean - std, color="#222222", linewidth=1.2,
-                       linestyle="--", label=f"±1σ  {std:.4f}")
+                       linestyle="--", label=f"+/- σ  {std:.4f}")
             ax.axvline(mean + std, color="#222222", linewidth=1.2,
                        linestyle="--")
 
-            ax.set_title(f"{dataset}\nn={n:,}", fontsize=13, fontweight="bold")
-            ax.set_xlabel("Pixel Density", fontsize=12)
-            ax.set_ylabel("Count", fontsize=12)
-            ax.tick_params(axis="both", labelsize=11)
-            ax.legend(fontsize=10, framealpha=0.85)
+            ax.set_title(dataset, fontsize=15, fontweight="bold", pad=10)
+            ax.set_xlabel("Pixel Density", fontsize=13)
+            ax.set_ylabel("Count", fontsize=13)
+            ax.tick_params(axis="both", labelsize=12)
+            ax.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.20),
+                ncol=2,
+                fontsize=9,
+                framealpha=0.9,
+                borderaxespad=0.0,
+                handlelength=1.4,
+                columnspacing=0.8,
+            )
             ax.grid(True, alpha=0.2, linestyle="--")
 
         fig.suptitle(
-            f"Datatype: {datatype}",
-            fontsize=15, fontweight="bold", y=0.97,
+            _histogram_datatype_title(datatype),
+            fontsize=18, fontweight="bold", y=0.96,
         )
 
         if save_dir is not None:

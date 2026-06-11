@@ -698,6 +698,16 @@ def plot_density_ratio_vs_resolution(
     plt.close(fig)
 
 
+HISTOGRAM_DATATYPE_TITLES = {
+    "PixelILT": "Optimized Mask",
+    "Litho": "Aerial",
+}
+
+
+def _histogram_datatype_title(datatype: str) -> str:
+    return HISTOGRAM_DATATYPE_TITLES.get(datatype, datatype)
+
+
 def plot_density_histograms(
     per_image_csv: Path,
     resolution:    int,
@@ -762,9 +772,9 @@ def plot_density_histograms(
             continue
 
         n_cols = len(active)
-        fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4),
+        fig, axes = plt.subplots(1, n_cols, figsize=(5.5 * n_cols, 4.8),
                                  constrained_layout=False)
-        fig.subplots_adjust(top=0.88, bottom=0.12, left=0.07, right=0.97, wspace=0.35)
+        fig.subplots_adjust(top=0.84, bottom=0.15, left=0.07, right=0.97, wspace=0.35)
         if n_cols == 1:
             axes = [axes]
 
@@ -778,20 +788,20 @@ def plot_density_histograms(
             ax.axvline(mean,       color="#222222", linewidth=1.8,
                        linestyle="-",  label=f"Mean {mean:.4f}")
             ax.axvline(mean - std, color="#222222", linewidth=1.2,
-                       linestyle="--", label=f"±1σ  {std:.4f}")
+                       linestyle="--", label=f"+/- sigma  {std:.4f}")
             ax.axvline(mean + std, color="#222222", linewidth=1.2,
                        linestyle="--")
 
-            ax.set_title(f"{dataset}\nn={len(vals):,}", fontsize=13, fontweight="bold")
-            ax.set_xlabel("Pixel Density", fontsize=12)
-            ax.set_ylabel("Count", fontsize=12)
-            ax.tick_params(axis="both", labelsize=11)
-            ax.legend(fontsize=10, framealpha=0.85)
+            ax.set_title(dataset, fontsize=15, fontweight="bold")
+            ax.set_xlabel("Pixel Density", fontsize=13)
+            ax.set_ylabel("Count", fontsize=13)
+            ax.tick_params(axis="both", labelsize=12)
+            ax.legend(fontsize=11, framealpha=0.85)
             ax.grid(True, alpha=0.2, linestyle="--")
 
         fig.suptitle(
-            f"Datatype: {datatype}  —  resolution: {resolution}px (average downsampling)",
-            fontsize=14, fontweight="bold", y=0.97,
+            f"{_histogram_datatype_title(datatype)}  —  resolution: {resolution}px (average downsampling)",
+            fontsize=18, fontweight="bold", y=0.96,
         )
 
         if save:
