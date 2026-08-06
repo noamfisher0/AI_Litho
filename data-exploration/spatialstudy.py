@@ -753,6 +753,12 @@ DATASET_COLOR_MAP = {
 
 VALID_METRICS = ("psnr", "ssim", "mse", "hf_ratio")
 
+# Human-readable display names for datatypes used in plot titles/subtitles
+DATATYPE_DISPLAY_NAMES = {
+    "Litho":    "Aerial",
+    "PixelILT": "Optimized Masks",
+}
+
 
 # ------------------------------------------------------------------------------
 # plot_metrics_from_csv  -- 4-metric overview
@@ -861,8 +867,9 @@ def plot_metrics_from_csv(
             )
 
             pretty_group = " & ".join(group_datasets)
+            display_dt = DATATYPE_DISPLAY_NAMES.get(datatype, datatype)
             fig.suptitle(
-                f"Spatial metric summary  |  Pattern: {datatype}  |  "
+                f"Spatial metric summary  |  Pattern: {display_dt}  |  "
                 f"Datasets: {pretty_group}  |  n = {num_samples} per subset",
                 fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
             )
@@ -990,8 +997,10 @@ def plot_single_metric(
             edgecolor="#aaaaaa",
             borderaxespad=0,
         )
-        fig.suptitle(f"Down-Sampling Resolution {axis_label} — {datatype}",
-                     fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold")
+        fig.suptitle(
+            f"Down-Sampling Resolution {axis_label} — {DATATYPE_DISPLAY_NAMES.get(datatype, datatype)}",
+            fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
+        )
 
         if save_dir is not None:
             out = save_dir / f"metric_{metric}_{datatype}.pdf"
@@ -1135,7 +1144,8 @@ def plot_single_metric_strip(
                         solid_capstyle="round", solid_joinstyle="round",
                     )
 
-        ax.set_title(f"{datatype}", fontsize=THESIS_LABEL_FONTSIZE, fontweight="bold", pad=8)
+        ax.set_title(DATATYPE_DISPLAY_NAMES.get(datatype, datatype),
+                     fontsize=THESIS_LABEL_FONTSIZE, fontweight="bold", pad=8)
         ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
         ax.set_xscale("log", base=2)
         ax.set_xticks(resolutions)
