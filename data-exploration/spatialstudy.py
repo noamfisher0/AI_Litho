@@ -805,7 +805,7 @@ def plot_metrics_from_csv(
             if not any(r["dataset"] in group_datasets for r in dt_rows):
                 continue
 
-            fig, axes = plt.subplots(2, 2, figsize=(6.5, 5.2), constrained_layout=True)
+            fig, axes = plt.subplots(2, 2, figsize=(8.0, 6.0), constrained_layout=True)
             axes = axes.flatten()
 
             for ax, metric in zip(axes, metrics):
@@ -829,6 +829,7 @@ def plot_metrics_from_csv(
 
                 ax.set_title(METRIC_LABELS[metric], fontsize=THESIS_LABEL_FONTSIZE, fontweight="bold", pad=6)
                 ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
+                ax.set_xscale("log", base=2)
                 ax.set_xticks(resolutions)
                 ax.set_xticklabels([str(r) for r in resolutions], fontsize=THESIS_TICK_FONTSIZE)
                 ax.tick_params(axis="y", labelsize=THESIS_TICK_FONTSIZE)
@@ -845,16 +846,18 @@ def plot_metrics_from_csv(
                            linewidth=2, markersize=8, label=m)
                 for m in methods
             ]
-            # Single combined legend placed inside the bottom-left subplot
+            # Single horizontal legend row below all subplots; constrained_layout makes room.
             all_handles = dataset_handles + [
-                plt.Line2D([0], [0], color="none", label="")
+                plt.Line2D([0], [0], color="none", label="  |  ")
             ] + method_handles
-            axes[2].legend(
+            fig.legend(
                 handles=all_handles,
-                title="Dataset / Method",
-                title_fontsize=9, fontsize=8,
-                loc="best", framealpha=0.9, edgecolor="#aaaaaa",
-                ncol=max(1, len(dataset_handles) + 1 + len(method_handles)),
+                loc="lower center",
+                ncol=len(all_handles),
+                fontsize=THESIS_TICK_FONTSIZE,
+                framealpha=0.9,
+                edgecolor="#aaaaaa",
+                bbox_to_anchor=(0.5, 0),
             )
 
             pretty_group = " & ".join(group_datasets)
@@ -923,7 +926,9 @@ def plot_single_metric(
     for datatype in datatypes:
         dt_rows = [r for r in rows if r["datatype"] == datatype]
 
-        fig, ax = plt.subplots(figsize=(6.5, 4.0), constrained_layout=True)
+        # Reserve right margin for the legend column; width accounts for it.
+        fig, ax = plt.subplots(figsize=(8.5, 5.0))
+        fig.subplots_adjust(top=0.90, bottom=0.12, left=0.10, right=0.72)
 
         for dataset in all_datasets:
             color   = DATASET_COLOR_MAP.get(dataset, "#888888")
@@ -955,6 +960,7 @@ def plot_single_metric(
 
         ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
         ax.set_ylabel(axis_label, fontsize=THESIS_LABEL_FONTSIZE)
+        ax.set_xscale("log", base=2)
         ax.set_xticks(resolutions)
         ax.set_xticklabels([str(r) for r in resolutions], fontsize=THESIS_TICK_FONTSIZE)
         ax.tick_params(axis="y", labelsize=THESIS_TICK_FONTSIZE)
@@ -971,24 +977,25 @@ def plot_single_metric(
                        linewidth=2, markersize=7, label=m)
             for m in methods
         ]
-        # Two separate legends placed inside the axes at fixed corners
-        leg_ds = ax.legend(
-            handles=colour_handles, title="Dataset",
-            title_fontsize=10, fontsize=9,
-            loc="upper left", framealpha=0.9, edgecolor="#aaaaaa",
-        )
-        ax.add_artist(leg_ds)
+        # Section-header handles: invisible line, label only — creates a text divider in the box
+        hdr = lambda t: plt.Line2D([], [], color="none", linewidth=0, markersize=0, label=t)
+        grouped_handles = [hdr("Datasets")] + colour_handles + [hdr("Method")] + method_handles
+        # Single unified legend outside the plot to the right
         ax.legend(
-            handles=method_handles, title="Method",
-            title_fontsize=10, fontsize=9,
-            loc="lower right", framealpha=0.9, edgecolor="#aaaaaa",
+            handles=grouped_handles,
+            bbox_to_anchor=(1.03, 1.0),
+            loc="upper left",
+            fontsize=THESIS_TICK_FONTSIZE,
+            framealpha=0.9,
+            edgecolor="#aaaaaa",
+            borderaxespad=0,
         )
-        fig.suptitle(f"Down-Sampling Resolution {axis_label} - {datatype}",
+        fig.suptitle(f"Down-Sampling Resolution {axis_label} — {datatype}",
                      fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold")
 
         if save_dir is not None:
             out = save_dir / f"metric_{metric}_{datatype}.pdf"
-            fig.savefig(out, bbox_inches="tight", pad_inches=0.03)
+            fig.savefig(out, bbox_inches="tight", pad_inches=0.05)
             print(f"  Saved: {out}")
 
         plt.show()
@@ -1003,9 +1010,14 @@ def plot_single_metric_strip(
     filter_methods:     list = None,
     filter_datasets:    list = None,
     strip_datatypes:    list = None,
+    uncertainty_style:  str  = "errorbar",
 ):
     if metric not in VALID_METRICS:
         raise ValueError(f"Invalid metric '{metric}'. Choose from: {VALID_METRICS}")
+    if uncertainty_style not in {"band", "errorbar", "none"}:
+        raise ValueError(
+            "uncertainty_style must be one of {'band', 'errorbar', 'none'}"
+        )
 
     std_col = f"{metric}_std"
     if save_dir is not None:
@@ -1061,11 +1073,9 @@ def plot_single_metric_strip(
         print("No resolutions remaining after filtering.")
         return
 
-    n_dt = len(datatypes)
-    # Width scaled to panel count but capped to A4 text width (6.5 in); height kept compact.
-    fig_w = min(6.5, max(2.8 * n_dt, 5.0))
-    fig, axes = plt.subplots(1, n_dt, figsize=(fig_w, 3.2), sharey=False,
-                             constrained_layout=True)
+    n_dt  = len(datatypes)
+    fig_w = max(7.0 * n_dt, 16.0)
+    fig, axes = plt.subplots(1, n_dt, figsize=(fig_w, 5.5), sharey=False)
     if n_dt == 1:
         axes = [axes]
 
@@ -1078,7 +1088,7 @@ def plot_single_metric_strip(
                 continue
             for method in methods:
                 ls     = METHOD_LINESTYLES.get(method, "-")
-                marker = METHOD_MARKERS.get(method, "o")
+                marker = "o"
                 means, stds = [], []
                 for res in resolutions:
                     match = [r for r in ds_rows if r["method"] == method and r["resolution"] == res]
@@ -1094,53 +1104,99 @@ def plot_single_metric_strip(
                 plot_stds  = [s for s, m in zip(stds, means) if not math.isnan(m)]
                 if not plot_res:
                     continue
-                ax.errorbar(plot_res, plot_means, yerr=plot_stds,
-                            fmt=f"{marker}{ls}", color=color,
-                            markersize=7, linewidth=2, capsize=4,
-                            capthick=1.2, elinewidth=1.0, label="_nolegend_")
+
+                if uncertainty_style == "band":
+                    lower = np.array(plot_means) - np.array(plot_stds)
+                    upper = np.array(plot_means) + np.array(plot_stds)
+                    ax.fill_between(
+                        plot_res, lower, upper,
+                        color=color, alpha=0.18, linewidth=0, zorder=1,
+                    )
+                    ax.plot(
+                        plot_res, plot_means,
+                        linestyle=ls, marker=marker, color=color,
+                        linewidth=2.2, markersize=4,
+                        solid_capstyle="round", solid_joinstyle="round",
+                        zorder=2,
+                    )
+                elif uncertainty_style == "errorbar":
+                    ax.errorbar(
+                        plot_res, plot_means, yerr=plot_stds,
+                        fmt=f"{marker}{ls}", color=color,
+                        markersize=4, linewidth=2.2,
+                        capsize=2, capthick=0.8, elinewidth=0.8,
+                        solid_capstyle="round", solid_joinstyle="round",
+                    )
+                else:
+                    ax.plot(
+                        plot_res, plot_means,
+                        linestyle=ls, marker=marker, color=color,
+                        linewidth=2.2, markersize=4,
+                        solid_capstyle="round", solid_joinstyle="round",
+                    )
 
         ax.set_title(f"{datatype}", fontsize=THESIS_LABEL_FONTSIZE, fontweight="bold", pad=8)
         ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
+        ax.set_xscale("log", base=2)
         ax.set_xticks(resolutions)
         ax.set_xticklabels([str(r) for r in resolutions], fontsize=THESIS_TICK_FONTSIZE)
         ax.tick_params(axis="y", labelsize=THESIS_TICK_FONTSIZE)
         ax.grid(True, alpha=0.25, linestyle="--")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.margins(x=0.03, y=0.08)
 
     axes[0].set_ylabel(METRIC_LABELS.get(metric, metric), fontsize=THESIS_LABEL_FONTSIZE)
 
     dataset_handles = [
-        plt.Line2D([0], [0], color=DATASET_COLOR_MAP.get(ds, "#888"), linewidth=3, label=ds)
+        plt.Line2D([0], [0], color=DATASET_COLOR_MAP.get(ds, "#888"), linewidth=2.5, label=ds)
         for ds in all_datasets
     ]
     method_handles = [
-        plt.Line2D([0], [0], color="#444444",
-                   linestyle=METHOD_LINESTYLES.get(m, "-"),
-                   marker=METHOD_MARKERS.get(m, "o"),
-                   linewidth=2, markersize=7, label=m)
+        plt.Line2D(
+            [0], [0], color="black",
+            linestyle=METHOD_LINESTYLES.get(m, "-"),
+            linewidth=2.2, label=m,
+        )
         for m in methods
     ]
 
-    # Place both legends inside the last panel to avoid any dead whitespace below.
-    leg_ds = axes[-1].legend(
-        handles=dataset_handles, title="Dataset", title_fontsize=9, fontsize=8,
-        loc="upper right", framealpha=0.9, edgecolor="#aaaaaa",
+    # Build a single horizontal legend with "Datasets" and "Methods" section
+    # labels and a "|" text divider between them. Invisible Line2D handles
+    # produce label-only (text) entries with no visible line icon.
+    def _text_entry(label):
+        return plt.Line2D([], [], color="none", linewidth=0, markersize=0, label=label)
+
+    legend_handles = (
+        [_text_entry(r"$\bf{Datasets:}$")] +
+        dataset_handles +
+        [_text_entry("  |  ")] +
+        [_text_entry(r"$\bf{Methods:}$")] +
+        method_handles
     )
-    axes[-1].add_artist(leg_ds)
-    axes[-1].legend(
-        handles=method_handles, title="Method", title_fontsize=9, fontsize=8,
-        loc="lower right", framealpha=0.9, edgecolor="#aaaaaa",
+
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=len(legend_handles),
+        frameon=True,
+        framealpha=0.95,
+        edgecolor="#aaaaaa",
+        fontsize=THESIS_TICK_FONTSIZE,
     )
 
     fig.suptitle(
         f"Down-Sampling Resolution VS {METRIC_LABELS.get(metric, metric)}",
         fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
     )
+    fig.subplots_adjust(top=0.88, bottom=0.18, left=0.07, right=0.98, wspace=0.28)
 
     if save_dir is not None:
         tag_dts = "-".join(datatypes)
         methods_tag = "_".join(methods)
         out = save_dir / f"metric_strip_{metric}_{tag_dts}_{methods_tag}.pdf"
-        fig.savefig(out, bbox_inches="tight", pad_inches=0.03)
+        fig.savefig(out, bbox_inches="tight", pad_inches=0.05)
         print(f"  Saved: {out}")
 
     plt.show()
