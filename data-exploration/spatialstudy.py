@@ -805,8 +805,7 @@ def plot_metrics_from_csv(
             if not any(r["dataset"] in group_datasets for r in dt_rows):
                 continue
 
-            fig, axes = plt.subplots(2, 2, figsize=(14, 11), constrained_layout=False)
-            fig.subplots_adjust(top=0.90, bottom=0.15, hspace=0.34, wspace=0.24)
+            fig, axes = plt.subplots(2, 2, figsize=(6.5, 5.2), constrained_layout=True)
             axes = axes.flatten()
 
             for ax, metric in zip(axes, metrics):
@@ -839,12 +838,6 @@ def plot_metrics_from_csv(
                 plt.Line2D([0], [0], color=dataset_color[ds], linewidth=3, label=ds)
                 for ds in group_datasets
             ]
-            legend_ds = fig.legend(
-                handles=dataset_handles, title="Dataset",
-                title_fontsize=11, fontsize=10,
-                loc="upper left", bbox_to_anchor=(0.04, 0.13),
-                ncol=len(group_datasets), framealpha=0.9, edgecolor="#aaaaaa",
-            )
             method_handles = [
                 plt.Line2D([0], [0], color="#444444",
                            linestyle=METHOD_LINESTYLES.get(m, "-"),
@@ -852,24 +845,28 @@ def plot_metrics_from_csv(
                            linewidth=2, markersize=8, label=m)
                 for m in methods
             ]
-            fig.legend(
-                handles=method_handles, title="Downsampling Method",
-                title_fontsize=11, fontsize=10,
-                loc="upper right", bbox_to_anchor=(0.96, 0.13),
-                ncol=len(methods), framealpha=0.9, edgecolor="#aaaaaa",
+            # Single combined legend placed inside the bottom-left subplot
+            all_handles = dataset_handles + [
+                plt.Line2D([0], [0], color="none", label="")
+            ] + method_handles
+            axes[2].legend(
+                handles=all_handles,
+                title="Dataset / Method",
+                title_fontsize=9, fontsize=8,
+                loc="best", framealpha=0.9, edgecolor="#aaaaaa",
+                ncol=max(1, len(dataset_handles) + 1 + len(method_handles)),
             )
-            fig.add_artist(legend_ds)
 
             pretty_group = " & ".join(group_datasets)
             fig.suptitle(
                 f"Spatial metric summary  |  Pattern: {datatype}  |  "
                 f"Datasets: {pretty_group}  |  n = {num_samples} per subset",
-                fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.965,
+                fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
             )
 
             if save_dir is not None:
-                out = save_dir / f"metrics_{datatype}_{group_name}.png"
-                fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
+                out = save_dir / f"metrics_{datatype}_{group_name}.pdf"
+                fig.savefig(out, bbox_inches="tight", pad_inches=0.03)
                 print(f"  Saved: {out}")
 
             plt.show()
@@ -926,8 +923,7 @@ def plot_single_metric(
     for datatype in datatypes:
         dt_rows = [r for r in rows if r["datatype"] == datatype]
 
-        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=False)
-        fig.subplots_adjust(top=0.86, bottom=0.10, left=0.10, right=0.76)
+        fig, ax = plt.subplots(figsize=(6.5, 4.0), constrained_layout=True)
 
         for dataset in all_datasets:
             color   = DATASET_COLOR_MAP.get(dataset, "#888888")
@@ -975,25 +971,24 @@ def plot_single_metric(
                        linewidth=2, markersize=7, label=m)
             for m in methods
         ]
-        legend_ds = fig.legend(
+        # Two separate legends placed inside the axes at fixed corners
+        leg_ds = ax.legend(
             handles=colour_handles, title="Dataset",
-            title_fontsize=11, fontsize=10,
-            loc="upper left", bbox_to_anchor=(0.77, 0.88),
-            framealpha=0.9, edgecolor="#aaaaaa",
+            title_fontsize=10, fontsize=9,
+            loc="upper left", framealpha=0.9, edgecolor="#aaaaaa",
         )
-        fig.legend(
+        ax.add_artist(leg_ds)
+        ax.legend(
             handles=method_handles, title="Method",
-            title_fontsize=11, fontsize=10,
-            loc="upper left", bbox_to_anchor=(0.77, 0.52),
-            framealpha=0.9, edgecolor="#aaaaaa",
+            title_fontsize=10, fontsize=9,
+            loc="lower right", framealpha=0.9, edgecolor="#aaaaaa",
         )
-        fig.add_artist(legend_ds)
         fig.suptitle(f"Down-Sampling Resolution {axis_label} - {datatype}",
-                     fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.965)
+                     fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold")
 
         if save_dir is not None:
-            out = save_dir / f"metric_{metric}_{datatype}.png"
-            fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
+            out = save_dir / f"metric_{metric}_{datatype}.pdf"
+            fig.savefig(out, bbox_inches="tight", pad_inches=0.03)
             print(f"  Saved: {out}")
 
         plt.show()
@@ -1067,7 +1062,10 @@ def plot_single_metric_strip(
         return
 
     n_dt = len(datatypes)
-    fig, axes = plt.subplots(1, n_dt, figsize=(max(4.2 * n_dt, 12), 5.8), sharey=False)
+    # Width scaled to panel count but capped to A4 text width (6.5 in); height kept compact.
+    fig_w = min(6.5, max(2.8 * n_dt, 5.0))
+    fig, axes = plt.subplots(1, n_dt, figsize=(fig_w, 3.2), sharey=False,
+                             constrained_layout=True)
     if n_dt == 1:
         axes = [axes]
 
@@ -1122,24 +1120,27 @@ def plot_single_metric_strip(
         for m in methods
     ]
 
-    fig.legend(handles=dataset_handles, title="Dataset", title_fontsize=11, fontsize=10,
-               loc="lower center", bbox_to_anchor=(0.28, 0.07),
-               ncol=max(1, len(dataset_handles)), framealpha=0.9, edgecolor="#aaaaaa")
-    fig.legend(handles=method_handles, title="Method", title_fontsize=11, fontsize=10,
-               loc="lower center", bbox_to_anchor=(0.73, 0.07),
-               ncol=max(1, len(method_handles)), framealpha=0.9, edgecolor="#aaaaaa")
+    # Place both legends inside the last panel to avoid any dead whitespace below.
+    leg_ds = axes[-1].legend(
+        handles=dataset_handles, title="Dataset", title_fontsize=9, fontsize=8,
+        loc="upper right", framealpha=0.9, edgecolor="#aaaaaa",
+    )
+    axes[-1].add_artist(leg_ds)
+    axes[-1].legend(
+        handles=method_handles, title="Method", title_fontsize=9, fontsize=8,
+        loc="lower right", framealpha=0.9, edgecolor="#aaaaaa",
+    )
 
     fig.suptitle(
-        f"Down-Sampling Resolution VS MSE",
-        fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.98,
+        f"Down-Sampling Resolution VS {METRIC_LABELS.get(metric, metric)}",
+        fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
     )
-    fig.subplots_adjust(top=0.86, bottom=0.34, left=0.06, right=0.995, wspace=0.20)
 
     if save_dir is not None:
         tag_dts = "-".join(datatypes)
         methods_tag = "_".join(methods)
-        out = save_dir / f"metric_strip_{metric}_{tag_dts}_{methods_tag}.png"
-        fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
+        out = save_dir / f"metric_strip_{metric}_{tag_dts}_{methods_tag}.pdf"
+        fig.savefig(out, bbox_inches="tight", pad_inches=0.03)
         print(f"  Saved: {out}")
 
     plt.show()
@@ -1202,7 +1203,7 @@ def plot_metric_bar(
     width = 0.75 / n_met
     x     = np.arange(n_dt)
 
-    fig, ax = plt.subplots(figsize=(max(9, n_dt * 1.4), 6))
+    fig, ax = plt.subplots(figsize=(6.5, 3.8), constrained_layout=True)
 
     for i, method in enumerate(methods):
         offsets = x - 0.375 + (i + 0.5) * width
@@ -1233,14 +1234,13 @@ def plot_metric_bar(
         f"{METRIC_LABELS.get(metric, metric)}  |  Dataset: {dataset}  |  Resolution: {resolution}px",
         fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
     )
-    ax.legend(title="Method", title_fontsize=12, fontsize=11, framealpha=0.9)
+    ax.legend(title="Method", title_fontsize=10, fontsize=9, framealpha=0.9)
     ax.grid(True, axis="y", alpha=0.25, linestyle="--")
-    plt.tight_layout()
 
     if save_dir is not None:
         methods_tag = "_".join(methods)
-        out = save_dir / f"bar_{metric}_{dataset}_{resolution}px_{methods_tag}.png"
-        fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
+        out = save_dir / f"bar_{metric}_{dataset}_{resolution}px_{methods_tag}.pdf"
+        fig.savefig(out, bbox_inches="tight", pad_inches=0.03)
         print(f"  Saved: {out}")
 
     plt.show()
