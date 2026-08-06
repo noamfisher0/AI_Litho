@@ -126,6 +126,13 @@ NUM_SAMPLES = None
 
 TARGET_RESOLUTIONS = [1024, 512, 256, 128]
 
+THESIS_TITLE_FONTSIZE = 14
+THESIS_LABEL_FONTSIZE = 13
+THESIS_TICK_FONTSIZE = 12
+THESIS_PANEL_TITLE_FONTSIZE = 12
+THESIS_META_FONTSIZE = 10
+THESIS_SAVE_DPI = 300
+
 DATA_DICT = {
     "MetalSet-Printed":    str(DATA_ROOT / "MetalSet"       / "printed"),
     "MetalSet-Resist":     str(DATA_ROOT / "MetalSet"       / "resist"),
@@ -799,7 +806,7 @@ def plot_metrics_from_csv(
                 continue
 
             fig, axes = plt.subplots(2, 2, figsize=(14, 11), constrained_layout=False)
-            fig.subplots_adjust(top=0.91, bottom=0.18, hspace=0.42, wspace=0.30)
+            fig.subplots_adjust(top=0.90, bottom=0.15, hspace=0.34, wspace=0.24)
             axes = axes.flatten()
 
             for ax, metric in zip(axes, metrics):
@@ -821,11 +828,11 @@ def plot_metrics_from_csv(
                         ax.plot(resolutions, values, color=color, linestyle=ls,
                                 marker=marker, linewidth=2, markersize=7, label="_nolegend_")
 
-                ax.set_title(METRIC_LABELS[metric], fontsize=13, fontweight="bold", pad=6)
-                ax.set_xlabel("Resolution", fontsize=12)
+                ax.set_title(METRIC_LABELS[metric], fontsize=THESIS_LABEL_FONTSIZE, fontweight="bold", pad=6)
+                ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
                 ax.set_xticks(resolutions)
-                ax.set_xticklabels([str(r) for r in resolutions], fontsize=11)
-                ax.tick_params(axis="y", labelsize=11)
+                ax.set_xticklabels([str(r) for r in resolutions], fontsize=THESIS_TICK_FONTSIZE)
+                ax.tick_params(axis="y", labelsize=THESIS_TICK_FONTSIZE)
                 ax.grid(True, alpha=0.25, linestyle="--")
 
             dataset_handles = [
@@ -855,14 +862,14 @@ def plot_metrics_from_csv(
 
             pretty_group = " & ".join(group_datasets)
             fig.suptitle(
-                f"Downsampling Study  |  Datatype: {datatype}  |  "
+                f"Spatial metric summary  |  Pattern: {datatype}  |  "
                 f"Datasets: {pretty_group}  |  n = {num_samples} per subset",
-                fontsize=13, fontweight="bold", y=0.97,
+                fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.965,
             )
 
             if save_dir is not None:
                 out = save_dir / f"metrics_{datatype}_{group_name}.png"
-                plt.savefig(out, dpi=150, bbox_inches="tight")
+                fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
                 print(f"  Saved: {out}")
 
             plt.show()
@@ -920,7 +927,7 @@ def plot_single_metric(
         dt_rows = [r for r in rows if r["datatype"] == datatype]
 
         fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=False)
-        fig.subplots_adjust(top=0.88, bottom=0.10, left=0.10, right=0.75)
+        fig.subplots_adjust(top=0.86, bottom=0.10, left=0.10, right=0.76)
 
         for dataset in all_datasets:
             color   = DATASET_COLOR_MAP.get(dataset, "#888888")
@@ -950,11 +957,11 @@ def plot_single_metric(
                             markersize=8, linewidth=2, capsize=5,
                             capthick=1.4, elinewidth=1.2, label="_nolegend_")
 
-        ax.set_xlabel("Resolution", fontsize=13)
-        ax.set_ylabel(axis_label, fontsize=13)
+        ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
+        ax.set_ylabel(axis_label, fontsize=THESIS_LABEL_FONTSIZE)
         ax.set_xticks(resolutions)
-        ax.set_xticklabels([str(r) for r in resolutions], fontsize=12)
-        ax.tick_params(axis="y", labelsize=12)
+        ax.set_xticklabels([str(r) for r in resolutions], fontsize=THESIS_TICK_FONTSIZE)
+        ax.tick_params(axis="y", labelsize=THESIS_TICK_FONTSIZE)
         ax.grid(True, alpha=0.25, linestyle="--")
 
         colour_handles = [
@@ -981,16 +988,162 @@ def plot_single_metric(
             framealpha=0.9, edgecolor="#aaaaaa",
         )
         fig.add_artist(legend_ds)
-        fig.suptitle(f"{axis_label}  |  Datatype: {datatype}",
-                     fontsize=14, fontweight="bold", y=0.97)
+        fig.suptitle(f"Down-Sampling Resolution {axis_label} - {datatype}",
+                     fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.965)
 
         if save_dir is not None:
             out = save_dir / f"metric_{metric}_{datatype}.png"
-            plt.savefig(out, dpi=150, bbox_inches="tight")
+            fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
             print(f"  Saved: {out}")
 
         plt.show()
         plt.close(fig)
+
+
+def plot_single_metric_strip(
+    averaged_csv:       str,
+    metric:             str,
+    save_dir:           str  = None,
+    filter_resolutions: list = None,
+    filter_methods:     list = None,
+    filter_datasets:    list = None,
+    strip_datatypes:    list = None,
+):
+    if metric not in VALID_METRICS:
+        raise ValueError(f"Invalid metric '{metric}'. Choose from: {VALID_METRICS}")
+
+    std_col = f"{metric}_std"
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    with open(averaged_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            mean_val = row.get(metric, "")
+            std_val  = row.get(std_col, "")
+            rows.append({
+                "subset":      row["subset"],
+                "dataset":     row["dataset"],
+                "datatype":    row["datatype"],
+                "method":      row["method"],
+                "resolution":  int(row["resolution"]),
+                "num_samples": row.get("num_samples", "?"),
+                "mean": float(mean_val) if mean_val else float("nan"),
+                "std":  float(std_val)  if std_val  else float("nan"),
+            })
+
+    if not rows:
+        print(f"No data found in '{averaged_csv}'.")
+        return
+
+    def _ordered_unique(values):
+        return list(dict.fromkeys(values))
+
+    present_datatypes = _ordered_unique(r["datatype"] for r in rows)
+    if strip_datatypes is None:
+        datatypes = [dt for dt in DATATYPE_ORDER if dt in present_datatypes and dt != "LevelILT"]
+        datatypes += [dt for dt in present_datatypes if dt not in DATATYPE_ORDER and dt != "LevelILT"]
+    else:
+        datatypes = [dt for dt in strip_datatypes if dt in present_datatypes]
+
+    methods = [m for m in _ordered_unique(r["method"] for r in rows)
+               if filter_methods is None or m in filter_methods]
+    resolutions = sorted({r["resolution"] for r in rows}
+                         if filter_resolutions is None else
+                         {r["resolution"] for r in rows if r["resolution"] in filter_resolutions})
+    all_datasets = _ordered_unique(r["dataset"] for r in rows)
+    if filter_datasets is not None:
+        all_datasets = [d for d in all_datasets if d in filter_datasets]
+
+    if not datatypes:
+        print("No datatypes remaining after filtering.")
+        return
+    if not methods:
+        print("No methods remaining after filtering.")
+        return
+    if not resolutions:
+        print("No resolutions remaining after filtering.")
+        return
+
+    n_dt = len(datatypes)
+    fig, axes = plt.subplots(1, n_dt, figsize=(max(4.2 * n_dt, 12), 5.8), sharey=False)
+    if n_dt == 1:
+        axes = [axes]
+
+    for ax, datatype in zip(axes, datatypes):
+        dt_rows = [r for r in rows if r["datatype"] == datatype]
+        for dataset in all_datasets:
+            color   = DATASET_COLOR_MAP.get(dataset, "#888888")
+            ds_rows = [r for r in dt_rows if r["dataset"] == dataset]
+            if not ds_rows:
+                continue
+            for method in methods:
+                ls     = METHOD_LINESTYLES.get(method, "-")
+                marker = METHOD_MARKERS.get(method, "o")
+                means, stds = [], []
+                for res in resolutions:
+                    match = [r for r in ds_rows if r["method"] == method and r["resolution"] == res]
+                    if match and not math.isnan(match[0]["mean"]):
+                        means.append(match[0]["mean"])
+                        stds.append(match[0]["std"] if not math.isnan(match[0]["std"]) else 0.0)
+                    else:
+                        means.append(float("nan"))
+                        stds.append(float("nan"))
+
+                plot_res   = [r for r, m in zip(resolutions, means) if not math.isnan(m)]
+                plot_means = [m for m in means if not math.isnan(m)]
+                plot_stds  = [s for s, m in zip(stds, means) if not math.isnan(m)]
+                if not plot_res:
+                    continue
+                ax.errorbar(plot_res, plot_means, yerr=plot_stds,
+                            fmt=f"{marker}{ls}", color=color,
+                            markersize=7, linewidth=2, capsize=4,
+                            capthick=1.2, elinewidth=1.0, label="_nolegend_")
+
+        ax.set_title(f"{datatype}", fontsize=THESIS_LABEL_FONTSIZE, fontweight="bold", pad=8)
+        ax.set_xlabel("Resolution (px)", fontsize=THESIS_LABEL_FONTSIZE)
+        ax.set_xticks(resolutions)
+        ax.set_xticklabels([str(r) for r in resolutions], fontsize=THESIS_TICK_FONTSIZE)
+        ax.tick_params(axis="y", labelsize=THESIS_TICK_FONTSIZE)
+        ax.grid(True, alpha=0.25, linestyle="--")
+
+    axes[0].set_ylabel(METRIC_LABELS.get(metric, metric), fontsize=THESIS_LABEL_FONTSIZE)
+
+    dataset_handles = [
+        plt.Line2D([0], [0], color=DATASET_COLOR_MAP.get(ds, "#888"), linewidth=3, label=ds)
+        for ds in all_datasets
+    ]
+    method_handles = [
+        plt.Line2D([0], [0], color="#444444",
+                   linestyle=METHOD_LINESTYLES.get(m, "-"),
+                   marker=METHOD_MARKERS.get(m, "o"),
+                   linewidth=2, markersize=7, label=m)
+        for m in methods
+    ]
+
+    fig.legend(handles=dataset_handles, title="Dataset", title_fontsize=11, fontsize=10,
+               loc="lower center", bbox_to_anchor=(0.28, 0.07),
+               ncol=max(1, len(dataset_handles)), framealpha=0.9, edgecolor="#aaaaaa")
+    fig.legend(handles=method_handles, title="Method", title_fontsize=11, fontsize=10,
+               loc="lower center", bbox_to_anchor=(0.73, 0.07),
+               ncol=max(1, len(method_handles)), framealpha=0.9, edgecolor="#aaaaaa")
+
+    fig.suptitle(
+        f"Down-Sampling Resolution VS MSE",
+        fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.98,
+    )
+    fig.subplots_adjust(top=0.86, bottom=0.34, left=0.06, right=0.995, wspace=0.20)
+
+    if save_dir is not None:
+        tag_dts = "-".join(datatypes)
+        methods_tag = "_".join(methods)
+        out = save_dir / f"metric_strip_{metric}_{tag_dts}_{methods_tag}.png"
+        fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
+        print(f"  Saved: {out}")
+
+    plt.show()
+    plt.close(fig)
 
 
 # ------------------------------------------------------------------------------
@@ -1072,13 +1225,13 @@ def plot_metric_bar(
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(datatypes, rotation=30, ha="right", fontsize=13)
-    ax.set_xlabel("Datatype", fontsize=14)
-    ax.set_ylabel(METRIC_LABELS.get(metric, metric), fontsize=14)
-    ax.tick_params(axis="y", labelsize=13)
+    ax.set_xticklabels(datatypes, rotation=30, ha="right", fontsize=THESIS_LABEL_FONTSIZE)
+    ax.set_xlabel("Pattern", fontsize=THESIS_LABEL_FONTSIZE)
+    ax.set_ylabel(METRIC_LABELS.get(metric, metric), fontsize=THESIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="y", labelsize=THESIS_LABEL_FONTSIZE)
     ax.set_title(
-        f"{METRIC_LABELS.get(metric, metric)}  |  Dataset: {dataset}  |  Resolution: {resolution}",
-        fontsize=14, fontweight="bold",
+        f"{METRIC_LABELS.get(metric, metric)}  |  Dataset: {dataset}  |  Resolution: {resolution}px",
+        fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold",
     )
     ax.legend(title="Method", title_fontsize=12, fontsize=11, framealpha=0.9)
     ax.grid(True, axis="y", alpha=0.25, linestyle="--")
@@ -1087,7 +1240,7 @@ def plot_metric_bar(
     if save_dir is not None:
         methods_tag = "_".join(methods)
         out = save_dir / f"bar_{metric}_{dataset}_{resolution}px_{methods_tag}.png"
-        plt.savefig(out, dpi=150, bbox_inches="tight")
+        fig.savefig(out, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.03)
         print(f"  Saved: {out}")
 
     plt.show()
@@ -1142,31 +1295,32 @@ def _render_comparison_figure(
     into one figure.  save_path=None → show only.
     """
     n = len(panels)
-    fig, axes = plt.subplots(1, n, figsize=(max(5 * n, 10), 5.5))
+    fig, axes = plt.subplots(1, n, figsize=(max(4.2 * n, 9), 4.8))
     if n == 1:
         axes = [axes]
 
     for ax, (label, img, mse, psnr, ssim) in zip(axes, panels):
         ax.imshow(img, cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
-        ax.set_title(label, fontsize=11, fontweight="bold", pad=4)
+        ax.set_title(label, fontsize=THESIS_PANEL_TITLE_FONTSIZE, fontweight="bold", pad=6)
         ax.axis("off")
         if mse is not None:
             psnr_str    = f"{psnr:.2f} dB" if not math.isnan(psnr) else "∞"
             metric_text = f"MSE  = {mse:.5f}\nPSNR = {psnr_str}\nSSIM = {ssim:.4f}"
             ax.text(
-                0.5, -0.04, metric_text,
-                transform=ax.transAxes, ha="center", va="top",
-                fontsize=9, fontfamily="monospace", color="#222222",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
-                          edgecolor="#cccccc", linewidth=0.8),
+                0.02, 0.02, metric_text,
+                transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=THESIS_META_FONTSIZE, fontfamily="monospace", color="white",
+                linespacing=1.15,
+                bbox=dict(boxstyle="round,pad=0.28", facecolor="black",
+                          edgecolor="white", linewidth=0.7, alpha=0.65),
             )
 
-    fig.suptitle(suptitle, fontsize=10, fontweight="bold", y=0.999)
-    fig.subplots_adjust(top=0.88, bottom=0.18, left=0.02, right=0.98, wspace=0.06)
+    fig.suptitle(suptitle, fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.995)
+    fig.subplots_adjust(top=0.86, bottom=0.02, left=0.005, right=0.995, wspace=0.02)
 
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.02)
         print(f"  Saved: {save_path}")
 
     plt.show()
@@ -1185,6 +1339,160 @@ def _make_ds_panel(orig_gray, img, method_fn, res, native_h,
     ssim    = compute_ssim(orig_gray, up_gray)
     display = up_gray if show_reconstruction else to_grayscale(ds)
     return panel_label, display, mse, psnr, ssim
+
+
+def _build_visual_datatype_panels(
+    dataset:             str,
+    datatype:            str,
+    tile_name:           str,
+    resolution:          int = None,
+    methods:             list = None,
+    show_reconstruction: bool = False,
+    all_resolutions:     list = None,
+):
+    """Build a per-datatype visual comparison block."""
+    subset_key = f"{dataset}-{datatype}"
+    img_dir    = DATA_DICT.get(subset_key)
+    if img_dir is None:
+        print(f"  Skipping unknown subset '{subset_key}'.")
+        return None
+
+    img_path = Path(img_dir) / tile_name
+    if not img_path.exists():
+        print(f"  Tile '{tile_name}' not found in {subset_key} — skipping.")
+        return None
+
+    img = load_image(img_path)
+    if img is None:
+        print(f"  Failed to load {img_path} — skipping.")
+        return None
+
+    native_h  = img.shape[0]
+    orig_gray = to_grayscale(img)
+    orig_panel = (f"Original\n({native_h} × {native_h})", orig_gray, None, None, None)
+
+    resolution_mode = resolution is None
+
+    if resolution_mode:
+        method_name = methods[0]
+        fn          = ALL_METHODS.get(method_name)
+        if fn is None:
+            raise ValueError(f"Unknown method '{method_name}'.")
+
+        panels = [orig_panel]
+        for res in all_resolutions:
+            if res >= native_h:
+                continue
+            if show_reconstruction:
+                size_str = f"{res} → {native_h} px"
+            else:
+                size_str = f"{res} × {res} px"
+            panel_label = f"{res} px\n({size_str})"
+            panels.append(_make_ds_panel(orig_gray, img, fn, res, native_h,
+                                         show_reconstruction, panel_label))
+
+        mode_label = "resolution"
+        block_title = (
+            f"Image type: {datatype}  |  Method: {method_name}  |  Tile: {tile_name}"
+        )
+        fname = (
+            f"visual_strip_rescomp"
+            f"__{dataset}__{datatype}"
+            f"__method-{method_name}"
+            f"__{Path(tile_name).stem}.png"
+        )
+    else:
+        if resolution >= native_h:
+            print(f"  Resolution {resolution}px >= native {native_h}px for {datatype} — skipping.")
+            return None
+
+        panels = [orig_panel]
+        for method_name in methods:
+            fn = ALL_METHODS.get(method_name)
+            if fn is None:
+                raise ValueError(f"Unknown method '{method_name}'.")
+            if show_reconstruction:
+                size_str = f"{resolution} → {native_h} px"
+            else:
+                size_str = f"{resolution} × {resolution} px"
+            panel_label = f"{method_name}\n({size_str})"
+            panels.append(_make_ds_panel(orig_gray, img, fn, resolution, native_h,
+                                         show_reconstruction, panel_label))
+
+        mode_label = "method"
+        methods_str = "-".join(methods)
+        block_title = (
+            f"Image type: {datatype}  |  Resolution: {resolution}px  |  Tile: {tile_name}"
+        )
+        fname = (
+            f"visual_strip_methcomp"
+            f"__{dataset}__{datatype}"
+            f"__res-{resolution}px"
+            f"__methods-{methods_str}"
+            f"__{Path(tile_name).stem}.png"
+        )
+
+    return {
+        "dataset": dataset,
+        "datatype": datatype,
+        "native_h": native_h,
+        "panels": panels,
+        "block_title": block_title,
+        "fname": fname,
+        "mode_label": mode_label,
+        "resolution_mode": resolution_mode,
+    }
+
+
+def _render_visual_strip_figure(blocks: list, suptitle: str, save_path: Path = None):
+    """Render a single horizontal strip of datatype blocks."""
+    if not blocks:
+        return
+
+    n_blocks = len(blocks)
+    n_panels = len(blocks[0]["panels"])
+    fig = plt.figure(figsize=(max(3.6 * n_blocks * n_panels, 12), 5.2))
+    outer = fig.add_gridspec(1, n_blocks, wspace=0.04)
+
+    for col, block in enumerate(blocks):
+        inner = outer[0, col].subgridspec(2, len(block["panels"]),
+                                          height_ratios=[0.16, 1],
+                                          hspace=0.02, wspace=0.02)
+        title_ax = fig.add_subplot(inner[0, :])
+        title_ax.axis("off")
+        title_ax.text(
+            0.5, 0.5, block["block_title"],
+            ha="center", va="center", fontsize=THESIS_LABEL_FONTSIZE,
+            fontweight="bold",
+        )
+
+        for idx, (label, img, mse, psnr, ssim) in enumerate(block["panels"]):
+            ax = fig.add_subplot(inner[1, idx])
+            ax.imshow(img, cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+            ax.set_title(label, fontsize=THESIS_PANEL_TITLE_FONTSIZE, fontweight="bold", pad=6)
+            ax.axis("off")
+            if mse is not None:
+                psnr_str    = f"{psnr:.2f} dB" if not math.isnan(psnr) else "∞"
+                metric_text = f"MSE  = {mse:.5f}\nPSNR = {psnr_str}\nSSIM = {ssim:.4f}"
+                ax.text(
+                    0.02, 0.02, metric_text,
+                    transform=ax.transAxes, ha="left", va="bottom",
+                    fontsize=THESIS_META_FONTSIZE, fontfamily="monospace", color="white",
+                    linespacing=1.15,
+                    bbox=dict(boxstyle="round,pad=0.28", facecolor="black",
+                              edgecolor="white", linewidth=0.7, alpha=0.65),
+                )
+
+    fig.suptitle(suptitle, fontsize=THESIS_TITLE_FONTSIZE, fontweight="bold", y=0.995)
+    fig.subplots_adjust(top=0.88, bottom=0.02, left=0.005, right=0.995)
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=THESIS_SAVE_DPI, bbox_inches="tight", pad_inches=0.02)
+        print(f"  Saved: {save_path}")
+
+    plt.show()
+    plt.close(fig)
 
 
 # ------------------------------------------------------------------------------
@@ -1299,9 +1607,9 @@ def plot_visual_comparison(
 
             res_str  = "_".join(str(r) for r in all_resolutions)
             suptitle = (
-                f"Down-Sampling Method: {method_name}  |  "
-                f"Dataset: {dataset}  |  Datatype: {dt}  |  Tile: {tile_name}\n"
-                f"Showing: {view_label}"
+                f"Spatial resolution comparison  |  Method: {method_name}  |  "
+                f"Dataset: {dataset}  |  Pattern: {dt}  |  Tile: {tile_name}\n"
+                f"View: {view_label}"
             )
             fname = (
                 f"visual_rescomp"
@@ -1333,9 +1641,9 @@ def plot_visual_comparison(
 
             methods_str = "-".join(methods)
             suptitle = (
-                f"Resolution: {resolution} px  |  "
-                f"Dataset: {dataset}  |  Datatype: {dt}  |  Tile: {tile_name}\n"
-                # f"Showing: {view_label}"
+                f"Spatial downsampling comparison  |  Resolution: {resolution} px  |  "
+                f"Dataset: {dataset}  |  Pattern: {dt}  |  Tile: {tile_name}\n"
+                f"View: {view_label}"
             )
             fname = (
                 f"visual_methcomp"
@@ -1348,6 +1656,79 @@ def plot_visual_comparison(
 
         save_path = (save_dir / fname) if save_dir is not None else None
         _render_comparison_figure(panels, suptitle, save_path)
+
+
+def plot_visual_strip_comparison(
+    dataset:             str,
+    datatypes:           list = None,
+    resolution:          int  = None,
+    methods:             list = None,
+    show_reconstruction: bool = False,
+    save_dir:            str  = None,
+    seed:                int  = None,
+    all_resolutions:     list = None,
+):
+    """Generate a single strip figure across one or more datatypes."""
+    if methods is None:
+        methods = list(ALL_METHODS.keys())
+    if all_resolutions is None:
+        all_resolutions = sorted(TARGET_RESOLUTIONS)
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    present = [k.split("-", 1)[1] for k in DATA_DICT if k.startswith(f"{dataset}-")]
+    default_datatypes = [dt for dt in DATATYPE_ORDER if dt in present and dt != "LevelILT"]
+    default_datatypes += sorted(dt for dt in present if dt not in DATATYPE_ORDER and dt != "LevelILT")
+
+    if datatypes is None:
+        datatypes_to_plot = default_datatypes
+    else:
+        seen = set()
+        datatypes_to_plot = []
+        for dt in datatypes:
+            if dt not in seen:
+                seen.add(dt)
+                datatypes_to_plot.append(dt)
+
+    tile_name = _find_common_tile(dataset, seed=seed)
+    blocks = []
+    for dt in datatypes_to_plot:
+        block = _build_visual_datatype_panels(
+            dataset=dataset,
+            datatype=dt,
+            tile_name=tile_name,
+            resolution=resolution,
+            methods=methods,
+            show_reconstruction=show_reconstruction,
+            all_resolutions=all_resolutions,
+        )
+        if block is not None:
+            blocks.append(block)
+
+    if not blocks:
+        print(f"No strip panels could be built for dataset '{dataset}'.")
+        return
+
+    mode_tag = "reconstruction" if show_reconstruction else "downsampled"
+    if resolution is None:
+        method_name = methods[0]
+        suptitle = (
+            f"Spatial resolution strip comparison  |  Method: {method_name}  |  "
+            f"Dataset: {dataset}  |  View: {mode_tag}"
+        )
+        fname = f"visual_strip_rescomp__{dataset}__method-{method_name}__{mode_tag}__tile-{Path(tile_name).stem}.png"
+    else:
+        methods_str = "-".join(methods)
+        suptitle = (
+            f"Spatial downsampling strip comparison  |  Resolution: {resolution}px  |  "
+            f"Dataset: {dataset}  |  View: {mode_tag}"
+        )
+        fname = f"visual_strip_methcomp__{dataset}__res-{resolution}px__methods-{methods_str}__{mode_tag}__tile-{Path(tile_name).stem}.png"
+
+    save_path = (save_dir / fname) if save_dir is not None else None
+    _render_visual_strip_figure(blocks, suptitle, save_path)
 
 
 # ------------------------------------------------------------------------------
@@ -1380,15 +1761,25 @@ def parse_args():
     p.add_argument("--force",       action="store_true")
     p.add_argument("--save-plots",  action="store_true")
     p.add_argument("--csv",         type=str, default=None)
+    p.add_argument("--output-dir",   type=str, default=None,
+                   help="Directory where plots and logs are written.")
 
     # ── Visual comparison ─────────────────────────────────────────────────────
     p.add_argument("--plot-visual", action="store_true",
                    help="Generate visual comparison figures.")
+    p.add_argument("--plot-visual-strip", action="store_true",
+                   help="Generate a single strip figure across datatypes.")
+    p.add_argument("--plot-metric-strip", type=str, default=None, metavar="METRIC",
+                   help="Generate a strip of single-metric plots across datatypes.")
     p.add_argument("--visual-dataset", type=str, default=None, metavar="DS",
                    help="Dataset (e.g. metalset). Required for --plot-visual.")
     p.add_argument("--visual-datatype", type=str, default=None, metavar="DT",
                    help="Single datatype (e.g. PixelILT). "
                         "Omit to generate one figure per datatype using the same tile.")
+    p.add_argument("--visual-datatypes", type=str, nargs="+", default=None, metavar="DT",
+                   help="Datatypes to include in strip mode (default: all except LevelILT).")
+    p.add_argument("--strip-datatypes", type=str, nargs="+", default=None, metavar="DT",
+                   help="Datatypes to include in metric-strip mode (default: all except LevelILT).")
     p.add_argument("--visual-resolution", type=int, default=None, metavar="N",
                    help="Resolution for method-comparison mode (e.g. 512). "
                         "Omit to compare resolutions instead.")
@@ -1410,16 +1801,20 @@ if __name__ == "__main__":
     args = parse_args()
 
     if not any([args.evaluate, args.plot, args.tables, args.aggregate,
-                args.plot_metric, args.plot_visual, args.plot_bar]):
+                args.plot_metric, args.plot_metric_strip,
+                args.plot_visual, args.plot_visual_strip, args.plot_bar]):
         print("No action specified. Use --evaluate, --plot, --plot-metric, --plot-bar, "
-              "--aggregate, --plot-visual, or --tables.")
+              "--aggregate, --plot-visual, --plot-visual-strip, --plot-metric-strip, or --tables.")
         print("Run with --help for full usage.")
         sys.exit(0)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    setup_logging(LOG_FILE)
+    output_dir = Path(args.output_dir) if args.output_dir else OUTPUT_DIR
+    log_file = output_dir / "spatial_study.log"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(log_file)
     logger = get_logger()
-    averaged_csv = Path(args.csv) if args.csv else OUTPUT_DIR / "results_average.csv"
+    averaged_csv = Path(args.csv) if args.csv else output_dir / "results_average.csv"
 
     # ── Resolve method shorthands ─────────────────────────────────────────────
     resolved_methods = None
@@ -1468,7 +1863,7 @@ if __name__ == "__main__":
     # ── Evaluation ────────────────────────────────────────────────────────────
     if args.evaluate:
         averaged_csv = run_evaluation(
-            data_dict=DATA_DICT, output_dir=OUTPUT_DIR,
+            data_dict=DATA_DICT, output_dir=output_dir,
             num_workers=args.workers, num_samples=args.samples,
             eval_methods=filter_methods, eval_metrics=resolved_metrics,
             force=args.force, timeout=args.timeout,
@@ -1497,7 +1892,7 @@ if __name__ == "__main__":
             print("results_average.csv not found. Run --evaluate first.")
         else:
             print("\nGenerating plots ...")
-            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            save_dir = str(output_dir) if args.save_plots else None
             plot_metrics_from_csv(
                 str(averaged_csv), save_dir=save_dir,
                 filter_resolutions=filter_resolutions,
@@ -1506,6 +1901,23 @@ if __name__ == "__main__":
             )
 
     # ── Single-metric plot ────────────────────────────────────────────────────
+    if args.plot_metric_strip:
+        metric = args.plot_metric_strip.lower().strip()
+        if metric not in VALID_METRICS:
+            print(f"Unknown metric '{metric}'. Choose from: {VALID_METRICS}")
+        elif not averaged_csv.exists():
+            print("results_average.csv not found. Run --evaluate or --aggregate first.")
+        else:
+            print(f"\nGenerating single-metric strip for: {metric} ...")
+            save_dir = str(output_dir) if args.save_plots else None
+            plot_single_metric_strip(
+                str(averaged_csv), metric=metric, save_dir=save_dir,
+                filter_resolutions=filter_resolutions,
+                filter_methods=filter_methods,
+                filter_datasets=filter_datasets,
+                strip_datatypes=args.strip_datatypes,
+            )
+
     if args.plot_metric:
         metric = args.plot_metric.lower().strip()
         if metric not in VALID_METRICS:
@@ -1514,7 +1926,7 @@ if __name__ == "__main__":
             print("results_average.csv not found. Run --evaluate or --aggregate first.")
         else:
             print(f"\nGenerating single-metric plot for: {metric} ...")
-            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            save_dir = str(output_dir) if args.save_plots else None
             plot_single_metric(
                 str(averaged_csv), metric=metric, save_dir=save_dir,
                 filter_resolutions=filter_resolutions,
@@ -1547,7 +1959,7 @@ if __name__ == "__main__":
         else:
             print(f"\nGenerating bar chart: metric={bar_metric}, "
                   f"resolution={args.bar_resolution}px, dataset={bar_dataset} ...")
-            save_dir = str(OUTPUT_DIR) if args.save_plots else None
+            save_dir = str(output_dir) if args.save_plots else None
             plot_metric_bar(
                 str(averaged_csv), metric=bar_metric,
                 resolution=args.bar_resolution, dataset=bar_dataset,
@@ -1555,6 +1967,48 @@ if __name__ == "__main__":
             )
 
     # ── Visual comparison ─────────────────────────────────────────────────────
+    if args.plot_visual_strip:
+        if args.visual_dataset is None:
+            print("Error: --plot-visual-strip requires --visual-dataset.")
+            sys.exit(1)
+
+        vis_dataset = DATASET_SHORTHAND.get(args.visual_dataset.lower(), args.visual_dataset)
+
+        if filter_methods is not None:
+            vis_methods = filter_methods
+        elif args.visual_resolution is None:
+            vm = METHOD_SHORTHAND.get(args.visual_method.lower(), args.visual_method)
+            if vm not in ALL_METHODS:
+                print(f"Unknown method '{args.visual_method}'. Valid: pw, avg, fft")
+                sys.exit(1)
+            vis_methods = [vm]
+        else:
+            vis_methods = list(ALL_METHODS.keys())
+
+        vis_resolutions = filter_resolutions if filter_resolutions else sorted(TARGET_RESOLUTIONS, reverse=True)
+        strip_datatypes = args.visual_datatypes or ([args.visual_datatype] if args.visual_datatype else None)
+
+        if args.visual_resolution is None:
+            mode_desc = f"resolution strip (method={vis_methods[0]})"
+        else:
+            mode_desc = f"method strip (resolution={args.visual_resolution}px)"
+        dt_desc = strip_datatypes if strip_datatypes else "all non-LevelILT datatypes"
+
+        print(f"\nGenerating visual strip: {mode_desc}, dataset={vis_dataset}, datatypes={dt_desc}, "
+              f"reconstruction={args.visual_reconstruction} ...")
+
+        save_dir = str(output_dir) if args.save_plots else None
+        plot_visual_strip_comparison(
+            dataset=vis_dataset,
+            datatypes=strip_datatypes,
+            resolution=args.visual_resolution,
+            methods=vis_methods,
+            show_reconstruction=args.visual_reconstruction,
+            save_dir=save_dir,
+            seed=args.visual_seed,
+            all_resolutions=vis_resolutions,
+        )
+
     if args.plot_visual:
         if args.visual_dataset is None:
             print("Error: --plot-visual requires --visual-dataset.")
@@ -1590,8 +2044,7 @@ if __name__ == "__main__":
         print(f"\nGenerating visual comparisons: {mode_desc}, "
               f"dataset={vis_dataset}, datatypes={dt_desc}, "
               f"reconstruction={args.visual_reconstruction} ...")
-
-        save_dir = str(OUTPUT_DIR) if args.save_plots else None
+        save_dir = str(output_dir) if args.save_plots else None
         plot_visual_comparison(
             dataset=vis_dataset,
             datatype=args.visual_datatype,
